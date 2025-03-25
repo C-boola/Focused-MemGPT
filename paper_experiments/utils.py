@@ -26,8 +26,24 @@ def get_experiment_config(postgres_uri, endpoint_type="openai", model="gpt-4"):
     config.archival_storage_uri = postgres_uri
 
     if endpoint_type == "openai":
+        # Get the context window size with a fallback for models not in LLM_MAX_TOKENS
+        context_window = LLM_MAX_TOKENS.get(model, None)
+        if context_window is None:
+            print(f"Warning: Model {model} not found in LLM_MAX_TOKENS, using default context window size")
+            if "gpt-4o-mini" in model:
+                context_window = 128000  # Set a reasonable default for gpt-4o-mini
+            elif "gpt-4o" in model:
+                context_window = 128000  # Set a reasonable default for gpt-4o models
+            elif "gpt-4" in model:
+                context_window = 8192   # Set a reasonable default for gpt-4 models
+            elif "gpt-3.5" in model:
+                context_window = 16384  # Set a reasonable default for gpt-3.5 models
+            else:
+                context_window = 8192   # Default fallback
+            print(f"Using context window size of {context_window} for model {model}")
+            
         llm_config = LLMConfig(
-            model=model, model_endpoint_type="openai", model_endpoint="https://api.openai.com/v1", context_window=LLM_MAX_TOKENS[model]
+            model=model, model_endpoint_type="openai", model_endpoint="https://api.openai.com/v1", context_window=context_window
         )
         embedding_config = EmbeddingConfig(
             embedding_endpoint_type="openai",

@@ -1,0 +1,45 @@
+{
+    "model": "gpt-4o-mini",
+    "query_key": "1afcec1f-1acd-42e3-b833-e7882d5daada",
+    "query_key_value": "25f1a78d-a2f6-4c7d-8bd6-51226b263cbe",
+    "nesting": 1,
+    "results": [
+        {
+            "internal_monologue": null,
+            "id": "3ef554b2-8144-4a1c-961c-b76c3fc3a533",
+            "date": "2025-03-24T19:25:10.011149+00:00"
+        },
+        {
+            "function_call": "archival_memory_search({'query': '1afcec1f-1acd-42e3-b833-e7882d5daada'})",
+            "id": "3ef554b2-8144-4a1c-961c-b76c3fc3a533",
+            "date": "2025-03-24T19:25:10.011149+00:00"
+        },
+        {
+            "function_return": "Showing 1 of 1 results (page 0/0): [\"memory: Key-value pair: key = 1afcec1f-1acd-42e3-b833-e7882d5daada, value = 25f1a78d-a2f6-4c7d-8bd6-51226b263cbe\"]",
+            "status": "success",
+            "id": "457ab4d9-0a4f-42a1-ab87-ffd4233f04d0",
+            "date": "2025-03-24T19:25:10.077758+00:00"
+        },
+        {
+            "internal_monologue": null,
+            "id": "d58c6c7f-b68a-4f0f-a60a-7b9be03c4a3e",
+            "date": "2025-03-24T19:25:11.783661+00:00"
+        },
+        {
+            "function_call": "send_message({'message': '25f1a78d-a2f6-4c7d-8bd6-51226b263cbe'})",
+            "id": "d58c6c7f-b68a-4f0f-a60a-7b9be03c4a3e",
+            "date": "2025-03-24T19:25:11.783661+00:00"
+        },
+        {
+            "assistant_message": "25f1a78d-a2f6-4c7d-8bd6-51226b263cbe",
+            "id": "d58c6c7f-b68a-4f0f-a60a-7b9be03c4a3e",
+            "date": "2025-03-24T19:25:11.783661+00:00"
+        },
+        {
+            "function_return": "None",
+            "status": "success",
+            "id": "e6283be1-e4b8-4be3-80b3-7de474869a82",
+            "date": "2025-03-24T19:25:11.783877+00:00"
+        }
+    ]
+}

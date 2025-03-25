@@ -13,7 +13,7 @@ agent to perform a multi-hop lookup. In our setup, we fix
 the total number of UUIDs pairs to 140, corresponding to
 roughly 8k tokens (the context length of our GPT-4 base-
 line). We vary the total number of nesting levels from 0
-(the initial key-value pair’s value is not a key) to 4 (ie 4
+(the initial key-value pair's value is not a key) to 4 (ie 4
 total KV lookups are required to find the final value), and
 sample 30 different ordering configurations including both
 the initial key position and nesting key positions.
@@ -28,19 +28,18 @@ from tqdm import tqdm
 from collections import OrderedDict
 from openai import OpenAI
 import openai
-from memgpt import MemGPT
+from memgpt import create_client
 from memgpt.data_types import Message, AgentState, Passage
-from memgpt.cli.cli import attach
 from memgpt.agent_store.storage import StorageConnector, TableType
 from memgpt.config import MemGPTConfig
 from memgpt.metadata import MetadataStore
-from memgpt.cli.cli_config import delete
 from memgpt import utils
 from memgpt.constants import MAX_PAUSE_HEARTBEATS, RETRIEVAL_QUERY_DEFAULT_PAGE_SIZE, JSON_ENSURE_ASCII
 
 from typing import Optional
 
 from paper_experiments.utils import load_gzipped_file, get_experiment_config
+import time
 
 
 # TODO: update personas
@@ -90,45 +89,136 @@ def load_jsonl_to_list(filename):
     return data
 
 
-def run_nested_kv_task(config: MemGPTConfig, memgpt_client: MemGPT, kv_dict, user_message):
+def run_nested_kv_task(config: MemGPTConfig, memgpt_client, kv_dict, user_message):
     utils.DEBUG = True
+    print("Starting run_nested_kv_task function")
 
     # delete agent if exists
     user_id = uuid.UUID(config.anon_clientid)
     agent_name = f"{AGENT_NAME}_{config.default_llm_config.model}"
+    print(f"User ID: {user_id}")
+    
+    # First try to delete agent using the client directly by name
     try:
-        delete("agent", agent_name)
+        print(f"Trying to delete existing agent with name: {agent_name}")
+        # Check if agent exists
+        print("Listing existing agents...")
+        existing_agents = memgpt_client.list_agents()
+        print(f"Got existing agents: {type(existing_agents)}")
+        
+        # Handle different possible formats returned by list_agents
+        if hasattr(existing_agents, 'agents'):
+            agents_list = existing_agents.agents
+            print(f"Found agents list as attribute, length: {len(agents_list)}")
+        elif isinstance(existing_agents, dict) and 'agents' in existing_agents:
+            agents_list = existing_agents['agents']
+            print(f"Found agents list in dict, length: {len(agents_list)}")
+        else:
+            print(f"Unexpected format for list_agents response: {type(existing_agents)} - {existing_agents}")
+            agents_list = existing_agents if isinstance(existing_agents, list) else []
+            print(f"Using fallback agents list, length: {len(agents_list) if isinstance(agents_list, list) else 'not a list'}")
+        
+        agent_exists = False
+        agent_id = None
+        
+        print("Checking if our agent exists in the list...")
+        for agent in agents_list:
+            if hasattr(agent, 'name') and agent.name == agent_name:
+                agent_exists = True
+                agent_id = agent.id
+                print(f"Found existing agent {agent_name} with ID {agent_id}")
+                break
+            elif isinstance(agent, dict) and agent.get('name') == agent_name:
+                agent_exists = True
+                agent_id = agent.get('id')
+                print(f"Found existing agent {agent_name} with ID {agent_id}")
+                break
+        
+        if not agent_exists:
+            print(f"Agent {agent_name} not found in existing agents")
+        
+        if agent_exists and agent_id:
+            try:
+                # Convert agent_id to UUID object if it's a string
+                if isinstance(agent_id, str):
+                    agent_id = uuid.UUID(agent_id)
+                    print(f"Converted agent_id to UUID: {agent_id}")
+                
+                print(f"Attempting to delete agent with ID: {agent_id}")
+                memgpt_client.delete_agent(agent_id)
+                print(f"Successfully deleted existing agent {agent_name}")
+            except Exception as e:
+                print(f"Error deleting agent by ID: {e}")
+                
+                # As a fallback, try to force rename the existing agent
+                print(f"Will create agent with a different name to avoid conflict")
+                agent_name = f"{AGENT_NAME}_{config.default_llm_config.model}_{int(time.time())}"
     except Exception as e:
-        print(e)
+        print(f"Error checking/deleting agent: {e}")
+        import traceback
+        traceback.print_exc()
+        # If we encounter an error, use a unique agent name to avoid conflicts
+        agent_name = f"{AGENT_NAME}_{config.default_llm_config.model}_{int(time.time())}"
 
     # Create a new Agent that models the scenario setup
-    agent_state = memgpt_client.create_agent(
-        {
-            "name": agent_name,
-            "persona": NESTED_PERSONA,
-            "human": NESTED_HUMAN,
-            "llm_config": config.default_llm_config,
-            "embedding_config": config.default_embedding_config,
-        }
-    )
+    print(f"Creating agent with name: {agent_name}")
+    try:
+        agent_state = memgpt_client.create_agent(
+            name=agent_name,
+            persona=NESTED_PERSONA,
+            human=NESTED_HUMAN,
+        )
+        print(f"Successfully created agent with ID: {agent_state.id}")
+    except Exception as e:
+        print(f"Error creating agent: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
     # get agent
-    agent = memgpt_client.server._get_or_load_agent(user_id, agent_state.id)
-    agent.functions_python["archival_memory_search"] = archival_memory_text_search
+    try:
+        print(f"Attempting to get agent with ID: {agent_state.id}")
+        agent = memgpt_client.server._get_or_load_agent(user_id, agent_state.id)
+        print("Successfully got agent")
+        print("Adding custom archival_memory_search function")
+        agent.functions_python["archival_memory_search"] = archival_memory_text_search
+        print("Successfully added custom function")
 
-    # insert into archival
-    for i, (k, v) in tqdm(enumerate(kv_dict.items())):
-        document_string = f"Key-value pair: key = {k}, value = {v}"
-        # print("Inserting:", document_string)
-        agent.persistence_manager.archival_memory.insert(document_string, compute_embedding=False)
-    print(f"Inserted {len(agent.persistence_manager.archival_memory)} into archival memory.")
+        # insert into archival
+        print(f"Inserting {len(kv_dict)} key-value pairs into archival memory")
+        for i, (k, v) in tqdm(enumerate(kv_dict.items())):
+            if i % 20 == 0:
+                print(f"Inserted {i} items so far")
+            document_string = f"Key-value pair: key = {k}, value = {v}"
+            # The insert method no longer accepts compute_embedding parameter
+            agent.persistence_manager.archival_memory.insert(document_string)
+        print(f"Inserted {len(agent.persistence_manager.archival_memory)} into archival memory.")
+    except AttributeError as e:
+        print(f"Warning: Could not directly access agent. Error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Try alternative approach - insert archival memory through client API
+        print("Falling back to client API for inserting archival memory")
+        for i, (k, v) in tqdm(enumerate(kv_dict.items())):
+            if i % 20 == 0:
+                print(f"Inserted {i} items so far via API")
+            document_string = f"Key-value pair: key = {k}, value = {v}"
+            memgpt_client.insert_archival_memory(agent_state.id, document_string)
+        print("Inserted key-value pairs into archival memory through API.")
 
+    print(f"Sending user message: {user_message[:100]}...")
     response = memgpt_client.user_message(agent_id=agent_state.id, message=user_message)
+    print(f"Received response of type: {type(response)}")
 
     # for open models, make extra clear we need th response
     if config.default_llm_config.model_endpoint_type != "openai":
+        print("Model endpoint is not OpenAI, sending follow-up question")
         followup_message = "What is your final answer? Respond with only the answer."
+        print(f"Sending follow-up message: {followup_message}")
         response = memgpt_client.user_message(agent_id=agent_state.id, message=followup_message)
+        print(f"Received final response of type: {type(response)}")
+    
+    print("Task completed successfully, returning response")
     return response
 
 
@@ -315,15 +405,36 @@ if __name__ == "__main__":
             )
 
     if args.baseline == "memgpt":
-        # craete config
-        config = get_experiment_config(os.environ.get("PGVECTOR_TEST_DB_URL"), endpoint_type=provider, model=args.model)
-        config.save()  # save config to file
-
-        # create clien#t
-        memgpt_client = MemGPT()
-
-        # run task
-        results = run_nested_kv_task(config, memgpt_client, kv_dict, first_user_message)
+        # create config
+        postgres_uri = os.environ.get("MEMGPT_PGURI") or os.environ.get("PGVECTOR_TEST_DB_URL")
+        if not postgres_uri:
+            postgres_uri = "postgresql+pg8000://postgres:password@localhost:8888/postgres"
+            print(f"No database URI found in environment variables. Using default: {postgres_uri}")
+        else:
+            print(f"Using database URI from environment: {postgres_uri}")
+        
+        # Check if the model is available
+        print(f"Attempting to use model: {args.model}")
+        
+        try:
+            config = get_experiment_config(postgres_uri, endpoint_type=provider, model=args.model)
+            config.save()  # save config to file
+            print(f"Configuration saved successfully with model {config.default_llm_config.model}")
+            
+            # create client
+            print("Creating client...")
+            memgpt_client = create_client()
+            print("Client created successfully")
+            
+            # run task
+            print("Starting task execution...")
+            results = run_nested_kv_task(config, memgpt_client, kv_dict, first_user_message)
+            print("Task completed successfully")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     else:
         results = run_baseline(args.model, key_to_search, kv_dict)
 
@@ -335,11 +446,11 @@ if __name__ == "__main__":
         "results": results,
     }
 
+    # Create directory if it doesn't exist
+    os.makedirs("results/nested_kv", exist_ok=True)
+    
     # write to JSON file
-    if args.task == "kv_nested":
-        with open(filename, "w") as f:
-            json.dump(final_result, f, indent=4)
-    else:
-        raise NotImplementedError
-
-    print(filename)
+    with open(filename, "w") as f:
+        json.dump(final_result, f, indent=4)
+    
+    print(f"Results saved to: {filename}")
