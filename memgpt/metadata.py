@@ -311,7 +311,7 @@ class MetadataStore:
                 db = os.getenv("MEMGPT_PG_DB", "memgpt")
                 user = os.getenv("MEMGPT_PG_USER", "memgpt")
                 password = os.getenv("MEMGPT_PG_PASSWORD", "memgpt")
-                port = os.getenv("MEMGPT_PG_PORT", "5432")
+                port = os.getenv("MEMGPT_PG_PORT", "8888")
                 url = os.getenv("MEMGPT_PG_URL", "localhost")
                 self.uri = f"postgresql+pg8000://{user}:{password}@{url}:{port}/{db}"
         elif config.metadata_storage_type == "sqlite":
