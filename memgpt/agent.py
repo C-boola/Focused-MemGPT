@@ -620,6 +620,28 @@ class Agent(object):
 
         return messages, heartbeat_request, function_failed
 
+    def create_message_pair_embeddings(self, user_message: Message, ai_messages: List[Message]):
+        """Create and store embeddings for user-AI message pairs"""
+        try:
+            # Combine user message with all AI responses into a single context
+            message_pairs = []
+            for ai_msg in ai_messages:
+                if ai_msg.role == "assistant":
+                    # Create a combined context of user message and AI response
+                    combined_text = f"User: {user_message.text}\nAI: {ai_msg.text}"
+                    message_pairs.append(combined_text)
+            
+            # Store each message pair in archival memory
+            for pair in message_pairs:
+                self.persistence_manager.archival_memory.insert(pair)
+            
+            # Save the archival memory
+            self.persistence_manager.archival_memory.save()
+            
+        except Exception as e:
+            printd(f"Error creating message pair embeddings: {e}")
+            raise e
+
     def step(
         self,
         user_message: Union[Message, str],  # NOTE: should be json.dump(dict)
@@ -745,6 +767,8 @@ class Agent(object):
             if user_message is not None:
                 if isinstance(user_message, Message):
                     all_new_messages = [user_message] + all_response_messages
+                    # Create embeddings for the message pairs
+                    self.create_message_pair_embeddings(user_message, all_response_messages)
                 else:
                     raise ValueError(type(user_message))
             else:
