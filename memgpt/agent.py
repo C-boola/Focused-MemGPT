@@ -623,20 +623,16 @@ class Agent(object):
     def create_message_pair_embeddings(self, user_message: Message, ai_messages: List[Message]):
         """Create and store embeddings for user-AI message pairs"""
         try:
-            # Combine user message with all AI responses into a single context
-            message_pairs = []
-            for ai_msg in ai_messages:
-                if ai_msg.role == "assistant":
-                    # Create a combined context of user message and AI response
-                    combined_text = f"User: {user_message.text}\nAI: {ai_msg.text}"
-                    message_pairs.append(combined_text)
-            
-            # Store each message pair in archival memory
-            for pair in message_pairs:
-                self.persistence_manager.archival_memory.insert(pair)
-            
-            # Save the archival memory
-            self.persistence_manager.archival_memory.save()
+            # Only pair with the first AI message (consecutive response)
+            if ai_messages and ai_messages[0].role == "assistant":
+                # Create a combined context of user message and AI response
+                combined_text = f"User: {user_message.text}\nAI: {ai_messages[0].text}"
+                
+                # Store the message pair in archival memory
+                self.persistence_manager.archival_memory.insert(combined_text)
+                
+                # Save the archival memory
+                self.persistence_manager.archival_memory.save()
             
         except Exception as e:
             printd(f"Error creating message pair embeddings: {e}")
@@ -767,8 +763,9 @@ class Agent(object):
             if user_message is not None:
                 if isinstance(user_message, Message):
                     all_new_messages = [user_message] + all_response_messages
-                    # Create embeddings for the message pairs
-                    self.create_message_pair_embeddings(user_message, all_response_messages)
+                    # Create embeddings for the message pairs - only use the first AI response
+                    if all_response_messages and all_response_messages[0].role == "assistant":
+                        self.create_message_pair_embeddings(user_message, [all_response_messages[0]])
                 else:
                     raise ValueError(type(user_message))
             else:
