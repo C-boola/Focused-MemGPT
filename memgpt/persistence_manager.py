@@ -55,6 +55,14 @@ class LocalStateManager(PersistenceManager):
         self.archival_memory = EmbeddingArchivalMemory(agent_state)
         self.recall_memory = BaseRecallMemory(agent_state)
         # self.agent_state = agent_state
+        
+        # Initialize embedding model
+        from memgpt.embeddings import embedding_model
+        self.embedding_model = embedding_model(agent_state.embedding_config)
+        
+        # Initialize vector store
+        from memgpt.agent_store.storage import StorageConnector
+        self.vector_store = StorageConnector.get_archival_storage_connector(user_id=agent_state.user_id, agent_id=agent_state.id)
 
     def save(self):
         """Ensure storage connectors save data"""

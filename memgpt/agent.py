@@ -6,6 +6,7 @@ from pathlib import Path
 import traceback
 from typing import List, Tuple, Optional, cast, Union
 from tqdm import tqdm
+import numpy as np
 
 from memgpt.metadata import MetadataStore
 from memgpt.agent_store.storage import StorageConnector, TableType
@@ -333,6 +334,10 @@ class Agent(object):
         # Create the agent in the DB
         # self.save()
         self.update_state()
+
+        # Initialize centroid history
+        self.centroid_history = []
+        self.centroid_timestamps = []
 
     @property
     def messages(self) -> List[dict]:
@@ -805,13 +810,15 @@ class Agent(object):
                     if all_response_messages and all_response_messages[0].role == "assistant":
                         combined_texts = self.create_message_pair_embeddings(user_message, [all_response_messages[0]])
                         
-                        # Check memory pressure and potentially insert into archival memory
-                        current_total_tokens = response.usage.total_tokens
-                        if current_total_tokens > MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window):
-                            # Insert the combined texts into archival memory
-                            for text in combined_texts:
-                                self.persistence_manager.archival_memory.insert(text)
-                            self.persistence_manager.archival_memory.save()
+                        # Create a single embedding for the entire combined text
+                        combined_text = "\n".join(combined_texts)
+                        embedding = self.persistence_manager.embedding_model.get_text_embedding(combined_text)
+                        
+                        # Create passage using the standard pattern
+                        passage = self.persistence_manager.archival_memory.create_passage(combined_text, embedding)
+                        
+                        # Store in vector database
+                        self.persistence_manager.vector_store.insert(passage)
                 else:
                     raise ValueError(type(user_message))
             else:
@@ -1160,6 +1167,64 @@ class Agent(object):
         printd(
             f"Attached data source {source_name} to agent {self.agent_state.name}, consisting of {len(all_passages)}. Agent now has {total_agent_passages} embeddings in archival memory.",
         )
+
+    def store_centroid(self, centroid: np.ndarray):
+        """Store a centroid in the history with its timestamp.
+        
+        Args:
+            centroid: The centroid vector to store
+        """
+        self.centroid_history.append(centroid.tolist())  # Convert to list for JSON serialization
+        self.centroid_timestamps.append(get_utc_time().isoformat())
+
+    def get_centroid_history(self) -> List[Tuple[np.ndarray, str]]:
+        """Get the history of centroids with their timestamps.
+        
+        Returns:
+            List of tuples containing (centroid, timestamp)
+        """
+        return [(np.array(centroid), timestamp) for centroid, timestamp in zip(self.centroid_history, self.centroid_timestamps)]
+
+    def get_furthest_embeddings(self, k: int = 5) -> List[Tuple[str, float]]:
+        """Calculate the centroid of stored embeddings and return the top k furthest vectors.
+        
+        Args:
+            k: Number of furthest vectors to return
+            
+        Returns:
+            List of tuples containing (text, distance) for the top k furthest vectors
+        """
+        try:
+            # Get all embeddings from the vector store
+            all_embeddings = self.persistence_manager.vector_store.get_all_embeddings()
+            
+            if not all_embeddings:
+                return []
+                
+            # Extract embeddings and texts
+            embeddings = [item['embedding'] for item in all_embeddings]
+            texts = [item['text'] for item in all_embeddings]
+            
+            # Calculate centroid (mean of all embeddings)
+            centroid = np.mean(embeddings, axis=0)
+            
+            # Store the centroid in history
+            self.store_centroid(centroid)
+            
+            # Calculate distances from centroid
+            distances = []
+            for i, embedding in enumerate(embeddings):
+                # Calculate Euclidean distance
+                distance = np.linalg.norm(embedding - centroid)
+                distances.append((texts[i], distance))
+            
+            # Sort by distance (descending) and get top k
+            distances.sort(key=lambda x: x[1], reverse=True)
+            return distances[:k]
+            
+        except Exception as e:
+            printd(f"Error calculating furthest embeddings: {e}")
+            return []
 
 
 def save_agent(agent: Agent, ms: MetadataStore):
