@@ -620,22 +620,60 @@ class Agent(object):
 
         return messages, heartbeat_request, function_failed
 
-    def create_message_pair_embeddings(self, user_message: Message, ai_messages: List[Message]):
-        """Create and store embeddings for user-AI message pairs"""
+    def create_message_pair_embeddings(
+        self, 
+        user_message: Message, 
+        ai_messages: List[Message],
+        context_mode: str = "pair"  # Options: "single", "pair", "window"
+    ) -> List[str]:
+        """Create embeddings for messages based on context mode
+        
+        Args:
+            user_message: The user message
+            ai_messages: List of AI response messages
+            context_mode: How to create embeddings
+                - "single": Create embeddings for each message individually
+                - "pair": Create embeddings for consecutive user-AI message pairs
+                - "window": Create embeddings with more context (multiple messages)
+                
+        Returns:
+            List of combined text strings ready for embedding
+        """
         try:
-            # Only pair with the first AI message (consecutive response)
-            if ai_messages and ai_messages[0].role == "assistant":
-                # Create a combined context of user message and AI response
-                combined_text = f"User: {user_message.text}\nAI: {ai_messages[0].text}"
+            combined_texts = []
+            
+            if context_mode == "single":
+                # Create individual message embeddings
+                combined_texts.append(f"User: {user_message.text}")
+                for ai_msg in ai_messages:
+                    if ai_msg.role == "assistant":
+                        combined_texts.append(f"AI: {ai_msg.text}")
                 
-                # Store the message pair in archival memory
-                self.persistence_manager.archival_memory.insert(combined_text)
+            elif context_mode == "pair":
+                # Create embeddings for consecutive user-AI message pairs
+                if ai_messages and ai_messages[0].role == "assistant":
+                    combined_texts.append(f"User: {user_message.text}\nAI: {ai_messages[0].text}")
                 
-                # Save the archival memory
-                self.persistence_manager.archival_memory.save()
+            elif context_mode == "window":
+                # Create embeddings with more context (e.g., last 3 messages)
+                messages = [user_message] + ai_messages
+                window_size = 3  # Can be made configurable
+                
+                for i in range(len(messages) - window_size + 1):
+                    window = messages[i:i + window_size]
+                    combined_text = "\n".join([
+                        f"{msg.role.capitalize()}: {msg.text}" 
+                        for msg in window
+                    ])
+                    combined_texts.append(combined_text)
+            
+            else:
+                raise ValueError(f"Invalid context_mode: {context_mode}. Must be one of: 'single', 'pair', 'window'")
+            
+            return combined_texts
             
         except Exception as e:
-            printd(f"Error creating message pair embeddings: {e}")
+            printd(f"Error creating message embeddings: {e}")
             raise e
 
     def step(
@@ -765,7 +803,15 @@ class Agent(object):
                     all_new_messages = [user_message] + all_response_messages
                     # Create embeddings for the message pairs - only use the first AI response
                     if all_response_messages and all_response_messages[0].role == "assistant":
-                        self.create_message_pair_embeddings(user_message, [all_response_messages[0]])
+                        combined_texts = self.create_message_pair_embeddings(user_message, [all_response_messages[0]])
+                        
+                        # Check memory pressure and potentially insert into archival memory
+                        current_total_tokens = response.usage.total_tokens
+                        if current_total_tokens > MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window):
+                            # Insert the combined texts into archival memory
+                            for text in combined_texts:
+                                self.persistence_manager.archival_memory.insert(text)
+                            self.persistence_manager.archival_memory.save()
                 else:
                     raise ValueError(type(user_message))
             else:
