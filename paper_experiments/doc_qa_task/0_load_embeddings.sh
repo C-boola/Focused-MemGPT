@@ -1,17 +1,22 @@
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-06.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-07.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-08.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-09.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-01.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-02.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-03.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-04.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-05.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-06.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-07.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_2-08.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-01.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-02.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-03.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-04.jsonl
-python load_wikipedia_embeddings.py --file data/wikipedia_passages_shard_1-05.jsonl
+#!/bin/bash
+
+# Load Wikipedia embeddings into the database
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-06.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-07.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-08.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-09.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-01.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-02.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-03.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-04.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-05.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-06.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-07.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-08.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-01.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-02.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-03.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-04.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-05.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_1-00.jsonl
+poetry run python load_wikipedia_embeddings.py --file /home/samer/.cache/huggingface/hub/datasets--nlpkevinl--wikipedia_openai_embeddings/snapshots/99ceeb82bed4b59fe9412245cf450da992f5b198/wikipedia_passages_shard_2-00.jsonl

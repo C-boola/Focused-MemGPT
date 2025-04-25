@@ -5,7 +5,7 @@ import uuid
 import copy
 from pprint import pprint
 from tqdm import tqdm
-from memgpt.cli.cli_load import insert_passages_into_source
+# from memgpt.cli.cli_load import insert_passages_into_source # not used
 from memgpt.cli.cli_config import delete
 from memgpt.data_types import Passage
 from memgpt.config import MemGPTConfig
