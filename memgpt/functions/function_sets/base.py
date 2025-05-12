@@ -5,6 +5,7 @@ import math
 
 from memgpt.constants import MAX_PAUSE_HEARTBEATS, RETRIEVAL_QUERY_DEFAULT_PAGE_SIZE, JSON_ENSURE_ASCII
 from memgpt.agent import Agent
+from memgpt.utils import printd, get_local_time
 
 ### Functions / tools the agent can use
 # All functions should return a response string (or None)
@@ -146,16 +147,17 @@ def conversation_search_date(self: Agent, start_date: str, end_date: str, page: 
 
 def archival_memory_insert(self: Agent, content: str) -> Optional[str]:
     """
-    Add to archival memory. Make sure to phrase the memory contents such that it can be easily queried later.
+    DEPRECATED: Memory archival is handled automatically based on context relevance. This function does nothing.
 
     Args:
-        content (str): Content to write to the memory. All unicode (including emojis) are supported.
+        content (str): Content that would have been written to memory (ignored).
 
     Returns:
-        Optional[str]: None is always returned as this function does not produce a response.
+        str: Message indicating archival is automatic.
     """
-    self.persistence_manager.archival_memory.insert(content)
-    return None
+    printd(f"LLM attempted to call deprecated archival_memory_insert with content='{content}'")
+    # Do nothing with the content
+    return "Memory archival is handled automatically based on context relevance. Function call ignored."
 
 
 def archival_memory_search(self: Agent, query: str, page: Optional[int] = 0) -> Optional[str]:

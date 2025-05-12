@@ -190,6 +190,7 @@ class Agent(object):
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
+        num_recent_pairs_to_protect: int = 1 # New parameter
     ):
         # An agent can be created from a Preset object
         if preset is not None:
@@ -339,6 +340,11 @@ class Agent(object):
         self.centroid_history = []
         self.centroid_timestamps = []
 
+        # Ensure numpy is available if it wasn't auto-imported by something else
+        assert np, "NumPy import failed"
+
+        self.num_recent_pairs_to_protect = num_recent_pairs_to_protect # Store the new parameter
+
     @property
     def messages(self) -> List[dict]:
         """Getter method that converts the internal Message list into OpenAI-style dicts"""
@@ -410,6 +416,24 @@ class Agent(object):
         first_message: bool = False,  # hint
     ) -> chat_completion_response.ChatCompletionResponse:
         """Get response from LLM API"""
+
+        # Log context window usage
+        try:
+            try:
+                # Try with the specific model name first
+                prompt_tokens = count_tokens(json.dumps(message_sequence), self.model)
+            except Exception as e:
+                # If it fails (e.g., unknown model), fallback to a default tokenizer
+                print(f"Warning: count_tokens failed for model {self.model} ({e}), falling back to cl100k_base tokenizer.")
+                prompt_tokens = count_tokens(json.dumps(message_sequence), "cl100k_base")
+                
+            model_context_window = LLM_MAX_TOKENS.get(self.model) or LLM_MAX_TOKENS["DEFAULT"]
+            print(f"CONTEXT: Using {prompt_tokens}/{model_context_window} tokens for model {self.model}")
+        except Exception as e:
+            # Catch any other unexpected errors during logging
+            print(f"Warning: Could not calculate and log token count - {e}")
+
+
         try:
             response = create(
                 agent_state=self.agent_state,
@@ -681,82 +705,177 @@ class Agent(object):
             printd(f"Error creating message embeddings: {e}")
             raise e
 
+    def _archive_least_similar_context_pair(self):
+        printd(f"Attempting to archive least similar context pair (protecting last {self.num_recent_pairs_to_protect} pair(s))...")
+
+        min_messages_for_operation = 1 + (2 * self.num_recent_pairs_to_protect) + 2
+        if len(self._messages) < min_messages_for_operation:
+            printd(f"Not enough messages ({len(self._messages)}, need {min_messages_for_operation}) for centroid archival with protection. Skipping.")
+            return
+
+        all_identified_pairs_data = []
+        
+        i = 1 
+        while i < len(self._messages) - 1:
+            current_msg = self._messages[i]
+            next_msg = self._messages[i+1]
+            if current_msg.role == "user" and next_msg.role == "assistant":
+                user_msg_obj = current_msg
+                assistant_msg_obj = next_msg
+                try:
+                    combined_texts = self.create_message_pair_embeddings(user_msg_obj, [assistant_msg_obj])
+                    if not combined_texts:
+                        i += 1; continue
+                    combined_text = "\\n".join(combined_texts)
+                    embedding = self.persistence_manager.embedding_model.get_text_embedding(combined_text)
+                    all_identified_pairs_data.append({
+                        "user_msg": user_msg_obj, "assistant_msg": assistant_msg_obj,
+                        "user_idx": i, "assistant_idx": i + 1,
+                        "embedding": np.array(embedding)
+                    })
+                    i += 2 
+                except Exception as e:
+                    printd(f"Error embedding a pair for centroid consideration: {e}")
+                    i += 1 
+            else:
+                i += 1
+        
+        if not all_identified_pairs_data:
+            printd("No user-assistant pairs found in context. Skipping centroid archival.")
+            return
+
+        if self.num_recent_pairs_to_protect > 0 and len(all_identified_pairs_data) > self.num_recent_pairs_to_protect:
+            candidate_pairs_for_removal_data = all_identified_pairs_data[:-self.num_recent_pairs_to_protect]
+        elif self.num_recent_pairs_to_protect == 0:
+            candidate_pairs_for_removal_data = all_identified_pairs_data
+        else: # Not enough pairs to even exclude the protected ones, or only protected ones exist
+            printd(f"Not enough pairs ({len(all_identified_pairs_data)}) to select candidates beyond the {self.num_recent_pairs_to_protect} protected pairs. Skipping.")
+            return
+
+        if not candidate_pairs_for_removal_data or len(candidate_pairs_for_removal_data) < 1:
+            printd(f"Not enough candidate (non-protected) pairs ({len(candidate_pairs_for_removal_data)}) for centroid archival. Skipping.")
+            return
+
+        candidate_embeddings_list = [pair_data["embedding"] for pair_data in candidate_pairs_for_removal_data]
+        
+        if not candidate_embeddings_list:
+            printd("No embeddings from candidate pairs to calculate centroid. Skipping.")
+            return
+            
+        centroid = np.mean(candidate_embeddings_list, axis=0)
+
+        furthest_distance = -1.0
+        furthest_candidate_pair_details = None
+
+        for pair_data_item in candidate_pairs_for_removal_data:
+            distance = np.linalg.norm(pair_data_item["embedding"] - centroid)
+            if distance > furthest_distance:
+                furthest_distance = distance
+                furthest_candidate_pair_details = pair_data_item
+                
+        if furthest_candidate_pair_details is None:
+            printd("Could not identify a furthest candidate pair from centroid. Skipping.")
+            return
+
+        removed_user_msg = furthest_candidate_pair_details["user_msg"]
+        removed_assistant_msg = furthest_candidate_pair_details["assistant_msg"]
+
+        content_to_archive = f"User: {removed_user_msg.text}\\nAssistant: {removed_assistant_msg.text}"
+
+        print(f"AUTO-ARCHIVING (least similar candidate to centroid): User message (original context index {furthest_candidate_pair_details['user_idx']}): {removed_user_msg.text}")
+        print(f"AUTO-ARCHIVING (least similar candidate to centroid): Assistant message (original context index {furthest_candidate_pair_details['assistant_idx']}): {removed_assistant_msg.text}")
+
+        try:
+            self.persistence_manager.archival_memory.insert(content_to_archive)
+            printd(f"Successfully triggered archival insertion for least similar candidate pair.")
+        except Exception as e:
+            printd(f"CRITICAL Error calling archival_memory.insert for least similar candidate pair: {e}")
+            traceback.print_exc()
+
+        ids_to_remove_from_context = {removed_user_msg.id, removed_assistant_msg.id}
+        original_len = len(self._messages)
+        self._messages = [m for m in self._messages if m.id not in ids_to_remove_from_context]
+        removed_count = original_len - len(self._messages)
+
+        if removed_count > 0:
+            printd(f"Removed {removed_count} messages from active context after auto-archival of outlier candidate.")
+            self.update_state()
+        else:
+            printd("No messages were removed by candidate centroid logic (IDs might not have matched).")
+
     def step(
         self,
-        user_message: Union[Message, str],  # NOTE: should be json.dump(dict)
+        user_message: Union[Message, str],
         first_message: bool = False,
         first_message_retry_limit: int = FIRST_MESSAGE_ATTEMPTS,
         skip_verify: bool = False,
-        return_dicts: bool = True,  # if True, return dicts, if False, return Message objects
-        recreate_message_timestamp: bool = True,  # if True, when input is a Message type, recreated the 'created_at' field
-    ) -> Tuple[List[Union[dict, Message]], bool, bool, bool]:
+        return_dicts: bool = True,
+        recreate_message_timestamp: bool = True,
+    ) -> Tuple[List[Union[dict, Message]], bool, bool, bool, Optional[int]]:
         """Top-level event message handler for the MemGPT agent"""
 
         def strip_name_field_from_user_message(user_message_text: str) -> Tuple[str, Optional[str]]:
-            """If 'name' exists in the JSON string, remove it and return the cleaned text + name value"""
             try:
                 user_message_json = dict(json.loads(user_message_text, strict=JSON_LOADS_STRICT))
-                # Special handling for AutoGen messages with 'name' field
-                # Treat 'name' as a special field
-                # If it exists in the input message, elevate it to the 'message' level
                 name = user_message_json.pop("name", None)
                 clean_message = json.dumps(user_message_json, ensure_ascii=JSON_ENSURE_ASCII)
-
             except Exception as e:
                 print(f"{CLI_WARNING_PREFIX}handling of 'name' field failed with: {e}")
-
+                # Fallback if JSON parsing fails but we want to proceed
+                return user_message_text, None 
             return clean_message, name
 
         def validate_json(user_message_text: str, raise_on_error: bool) -> str:
             try:
                 user_message_json = dict(json.loads(user_message_text, strict=JSON_LOADS_STRICT))
-                user_message_json_val = json.dumps(user_message_json, ensure_ascii=JSON_ENSURE_ASCII)
-                return user_message_json_val
+                return json.dumps(user_message_json, ensure_ascii=JSON_ENSURE_ASCII)
             except Exception as e:
                 print(f"{CLI_WARNING_PREFIX}couldn't parse user input message as JSON: {e}")
                 if raise_on_error:
                     raise e
+                return user_message_text # Return original if not raising, allowing non-JSON
 
         try:
             # Step 0: add user message
             if user_message is not None:
                 if isinstance(user_message, Message):
-                    # Validate JSON via save/load
-                    user_message_text = validate_json(user_message.text, False)
-                    cleaned_user_message_text, name = strip_name_field_from_user_message(user_message_text)
+                    # Ensure text is valid JSON string for strip_name_field
+                    try:
+                        json.loads(user_message.text, strict=JSON_LOADS_STRICT)
+                        user_message_text_content = user_message.text
+                    except json.JSONDecodeError:
+                        # If not JSON, treat as plain string for stripping logic (which might just pass it through)
+                        user_message_text_content = user_message.text
+                        printd(f"User message text is not JSON, proceeding with raw text for name stripping: {user_message_text_content[:100]}")
+
+
+                    cleaned_user_message_text, name = strip_name_field_from_user_message(user_message_text_content)
 
                     if name is not None:
-                        # Update Message object
                         user_message.text = cleaned_user_message_text
                         user_message.name = name
-
-                    # Recreate timestamp
                     if recreate_message_timestamp:
                         user_message.created_at = get_utc_time()
 
                 elif isinstance(user_message, str):
-                    # Validate JSON via save/load
-                    user_message = validate_json(user_message, False)
-                    cleaned_user_message_text, name = strip_name_field_from_user_message(user_message)
+                    # user_message_str_content = validate_json(user_message, False) # validate_json expects a string and returns one
+                    # cleaned_user_message_text, name = strip_name_field_from_user_message(user_message_str_content)
+                    # Allow non-JSON through if validate_json doesn't raise
+                    validated_user_str = validate_json(user_message, False) # False means don't raise, returns original on error
+                    cleaned_user_message_text, name = strip_name_field_from_user_message(validated_user_str)
 
-                    # If user_message['name'] is not None, it will be handled properly by dict_to_message
-                    # So no need to run strip_name_field_from_user_message
 
-                    # Create the associated Message object (in the database)
                     user_message = Message.dict_to_message(
                         agent_id=self.agent_state.id,
                         user_id=self.agent_state.user_id,
                         model=self.model,
                         openai_message_dict={"role": "user", "content": cleaned_user_message_text, "name": name},
                     )
-
                 else:
                     raise ValueError(f"Bad type for user_message: {type(user_message)}")
 
                 self.interface.user_message(user_message.text, msg_obj=user_message)
-
                 input_message_sequence = self.messages + [user_message.to_openai_dict()]
-            # Alternatively, the requestor can send an empty user message
             else:
                 input_message_sequence = self.messages
 
@@ -770,98 +889,113 @@ class Agent(object):
                 while True:
                     response = self._get_ai_reply(
                         message_sequence=input_message_sequence,
-                        first_message=True,  # passed through to the prompt formatter
+                        first_message=True,
                     )
                     if verify_first_message_correctness(response, require_monologue=self.first_message_verify_mono):
                         break
-
                     counter += 1
                     if counter > first_message_retry_limit:
                         raise Exception(f"Hit first message retry limit ({first_message_retry_limit})")
-
             else:
                 response = self._get_ai_reply(
                     message_sequence=input_message_sequence,
                 )
 
-            # Step 2: check if LLM wanted to call a function
-            # (if yes) Step 3: call the function
-            # (if yes) Step 4: send the info on the function call and function response to LLM
+            # Step 2 & 3: Handle AI response and potential function calls
             response_message = response.choices[0].message
-            response_message.model_copy()  # TODO why are we copying here?
+            # response_message_copy = response_message.model_copy() # model_copy() might not exist, use deepcopy or ensure it's handled
             all_response_messages, heartbeat_request, function_failed = self._handle_ai_response(response_message)
 
-            # Add the extra metadata to the assistant response
-            # (e.g. enough metadata to enable recreating the API call)
-            # assert "api_response" not in all_response_messages[0]
-            # all_response_messages[0]["api_response"] = response_message_copy
-            # assert "api_args" not in all_response_messages[0]
-            # all_response_messages[0]["api_args"] = {
-            #     "model": self.model,
-            #     "messages": input_message_sequence,
-            #     "functions": self.functions,
-            # }
+            # Step 4: Process messages for context and storage
+            all_new_messages_this_turn = []
+            if user_message: # If there was an initial user message for this step
+                all_new_messages_this_turn.append(user_message)
+            all_new_messages_this_turn.extend(all_response_messages)
 
-            # Step 4: extend the message history
-            if user_message is not None:
-                if isinstance(user_message, Message):
-                    all_new_messages = [user_message] + all_response_messages
-                    # Create embeddings for the message pairs - only use the first AI response
-                    if all_response_messages and all_response_messages[0].role == "assistant":
-                        combined_texts = self.create_message_pair_embeddings(user_message, [all_response_messages[0]])
-                        
-                        # Create a single embedding for the entire combined text
-                        combined_text = "\n".join(combined_texts)
+
+            # Automatic embedding of the *current* user-assistant pair, if one was formed
+            if user_message and all_response_messages and all_response_messages[0].role == "assistant":
+                try:
+                    current_pair_user_msg = user_message
+                    current_pair_assistant_msg = all_response_messages[0]
+                    combined_texts = self.create_message_pair_embeddings(current_pair_user_msg, [current_pair_assistant_msg])
+                    if combined_texts:
+                        combined_text = "\\n".join(combined_texts)
                         embedding = self.persistence_manager.embedding_model.get_text_embedding(combined_text)
-                        
-                        # Create passage using the standard pattern
-                        passage = self.persistence_manager.archival_memory.create_passage(combined_text, embedding)
-                        
-                        # Store in vector database
+                        passage = self.persistence_manager.archival_memory.create_passage(combined_text, embedding) # create_passage is on ArchivalMemory
                         self.persistence_manager.vector_store.insert(passage)
-                else:
-                    raise ValueError(type(user_message))
-            else:
-                all_new_messages = all_response_messages
+                        printd(f"Automatically embedded and stored current user-assistant turn ({current_pair_user_msg.id}, {current_pair_assistant_msg.id}) to vector store.")
+                except Exception as e:
+                    printd(f"Error in automatic embedding of current turn: {e}")
+            
+            # Append all messages from this turn (user + AI responses) to the main context first
+            if all_new_messages_this_turn:
+                # Ensure all are Message objects before appending
+                processed_new_messages = []
+                for msg_data in all_new_messages_this_turn:
+                    if isinstance(msg_data, Message):
+                        processed_new_messages.append(msg_data)
+                    else:
+                        printd(f"Warning: Encountered non-Message object in all_new_messages_this_turn: {type(msg_data)}")
+                if processed_new_messages:
+                    self._append_to_messages(processed_new_messages)
 
-            # Check the memory pressure and potentially issue a memory pressure warning
+            # Memory pressure check (uses response.usage from the LLM call)
             current_total_tokens = response.usage.total_tokens
-            active_memory_warning = False
-            # We can't do summarize logic properly if context_window is undefined
+            active_memory_warning = False # Reset for this step's check
             if self.agent_state.llm_config.context_window is None:
-                # Fallback if for some reason context_window is missing, just set to the default
                 print(f"{CLI_WARNING_PREFIX}could not find context_window in config, setting to default {LLM_MAX_TOKENS['DEFAULT']}")
-                print(f"{self.agent_state}")
                 self.agent_state.llm_config.context_window = (
-                    LLM_MAX_TOKENS[self.model] if (self.model is not None and self.model in LLM_MAX_TOKENS) else LLM_MAX_TOKENS["DEFAULT"]
+                    LLM_MAX_TOKENS.get(self.model) or LLM_MAX_TOKENS["DEFAULT"]
                 )
-            if current_total_tokens > MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window):
+            
+            effective_context_window = int(self.agent_state.llm_config.context_window)
+
+            if current_total_tokens > MESSAGE_SUMMARY_WARNING_FRAC * effective_context_window:
                 printd(
-                    f"{CLI_WARNING_PREFIX}last response total_tokens ({current_total_tokens}) > {MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window)}"
+                    f"{CLI_WARNING_PREFIX}last response total_tokens ({current_total_tokens}) > {MESSAGE_SUMMARY_WARNING_FRAC * effective_context_window}"
                 )
-                # Only deliver the alert if we haven't already (this period)
+                active_memory_warning = True # Indicate threshold was crossed for this current step's logic
+                # Only set the persistent flag if it wasn't already set, to avoid repeated warnings from the same state
                 if not self.agent_alerted_about_memory_pressure:
-                    active_memory_warning = True
-                    self.agent_alerted_about_memory_pressure = True  # it's up to the outer loop to handle this
+                    self.agent_alerted_about_memory_pressure = True 
             else:
                 printd(
-                    f"last response total_tokens ({current_total_tokens}) < {MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window)}"
+                    f"last response total_tokens ({current_total_tokens}) < {MESSAGE_SUMMARY_WARNING_FRAC * effective_context_window}"
                 )
+                self.agent_alerted_about_memory_pressure = False # Reset persistent flag if below threshold
 
-            self._append_to_messages(all_new_messages)
-            messages_to_return = [msg.to_openai_dict() for msg in all_new_messages] if return_dicts else all_new_messages
-            return messages_to_return, heartbeat_request, function_failed, active_memory_warning, response.usage.completion_tokens
+            # Now, apply the centroid-based archival to the updated context
+            # ONLY if the memory warning threshold was just determined to be active from the last API call
+            if active_memory_warning: # This flag is set based on current_total_tokens vs threshold
+                printd(f"Memory pressure threshold met (or was already high based on last API call), attempting centroid archival.")
+                try:
+                    self._archive_least_similar_context_pair()
+                except Exception as e:
+                    printd(f"CRITICAL Error during _archive_least_similar_context_pair: {e}")
+                    traceback.print_exc()
+            else:
+                printd(f"Memory pressure threshold not met, skipping centroid archival.")
+
+            # Determine what messages to return to the caller (typically just the AI's output from this turn)
+            # `all_response_messages` are the Message objects generated by the AI in this step
+            messages_to_return_openai_dict = [msg.to_openai_dict() for msg in all_response_messages] if return_dicts else all_response_messages
+            
+            completion_tokens = response.usage.completion_tokens if hasattr(response.usage, 'completion_tokens') else None
+
+            return messages_to_return_openai_dict, heartbeat_request, function_failed, active_memory_warning, completion_tokens
 
         except Exception as e:
-            printd(f"step() failed\nuser_message = {user_message}\nerror = {e}")
+            printd(f"step() failed\\nuser_message = {user_message}\\nerror = {e}")
+            traceback.print_exc() # Print full traceback for easier debugging of step failures
 
-            # If we got a context alert, try trimming the messages length, then try again
             if is_context_overflow_error(e):
-                # A separate API call to run a summarizer
+                printd("Context overflow error detected. Attempting to summarize messages inplace.")
                 self.summarize_messages_inplace()
-
                 # Try step again
-                return self.step(user_message, first_message=first_message, return_dicts=return_dicts)
+                # Need to ensure user_message is in the correct format for retry
+                # If user_message was an object, it should still be an object
+                return self.step(user_message, first_message=first_message, skip_verify=skip_verify, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
             else:
                 printd(f"step() failed with an unrecognized exception: '{str(e)}'")
                 raise e
@@ -1225,6 +1359,56 @@ class Agent(object):
         except Exception as e:
             printd(f"Error calculating furthest embeddings: {e}")
             return []
+
+    def plot_centroids(self, save_path: Optional[str] = None):
+        """Plot the history of centroids using PCA for dimensionality reduction.
+        
+        Args:
+            save_path: Optional path to save the plot. If None, plot is displayed.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from sklearn.decomposition import PCA
+            import numpy as np
+            
+            if not self.centroid_history:
+                print("No centroids to plot")
+                return
+                
+            # Convert centroids to numpy array
+            centroids = np.array(self.centroid_history)
+            
+            # Reduce to 2D using PCA
+            pca = PCA(n_components=2)
+            centroids_2d = pca.fit_transform(centroids)
+            
+            # Create the plot
+            plt.figure(figsize=(10, 6))
+            
+            # Plot centroids
+            plt.scatter(centroids_2d[:, 0], centroids_2d[:, 1], c='blue', alpha=0.6)
+            
+            # Add timestamps as labels
+            for i, (x, y) in enumerate(centroids_2d):
+                plt.annotate(f"t{i+1}", (x, y), fontsize=8)
+            
+            # Connect centroids with lines to show progression
+            plt.plot(centroids_2d[:, 0], centroids_2d[:, 1], 'r--', alpha=0.3)
+            
+            plt.title("Centroid Evolution Over Time")
+            plt.xlabel("PCA Component 1")
+            plt.ylabel("PCA Component 2")
+            
+            if save_path:
+                plt.savefig(save_path)
+                print(f"Plot saved to {save_path}")
+            else:
+                plt.show()
+                
+        except ImportError as e:
+            print(f"Error: Required packages not found. Please install matplotlib and scikit-learn: {e}")
+        except Exception as e:
+            print(f"Error plotting centroids: {e}")
 
 
 def save_agent(agent: Agent, ms: MetadataStore):

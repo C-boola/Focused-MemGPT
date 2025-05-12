@@ -16,7 +16,7 @@ EMBEDDING_TO_TOKENIZER_MAP = {
 EMBEDDING_TO_TOKENIZER_DEFAULT = "cl100k_base"
 
 
-DEFAULT_MEMGPT_MODEL = "gpt-4"
+DEFAULT_MEMGPT_MODEL = "gpt-4o-mini"
 DEFAULT_PERSONA = "sam_pov"
 DEFAULT_HUMAN = "basic"
 DEFAULT_PRESET = "memgpt_chat"
@@ -55,6 +55,10 @@ NON_USER_MSG_PREFIX = "[This is an automated system message hidden from the user
 LLM_MAX_TOKENS = {
     "DEFAULT": 8192,
     ## OpenAI models: https://platform.openai.com/docs/models/overview
+    # gpt-4o
+    "gpt-4o-mini": 8192, # for debugging purposes
+    # "gpt-4o-mini": 128000,
+    "gpt-4.1-mini": 128000,
     # gpt-4
     "gpt-4-1106-preview": 128000,
     "gpt-4": 8192,

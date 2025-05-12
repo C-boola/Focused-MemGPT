@@ -320,6 +320,15 @@ def run_agent_loop(memgpt_agent, config: MemGPTConfig, first, ms: MetadataStore,
                 elif user_input.lower() == "/memorywarning":
                     user_message = system.get_token_limit_warning()
 
+                elif user_input.lower() == "/plot":
+                    try:
+                        memgpt_agent.plot_centroids()
+                    except ImportError as e:
+                        print(f"Error: Required packages not found. Please install matplotlib and scikit-learn: {e}")
+                    except Exception as e:
+                        print(f"Error plotting centroids: {e}")
+                    continue
+
                 elif user_input.lower() == "//":
                     multiline_input = not multiline_input
                     continue
