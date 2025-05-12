@@ -190,7 +190,8 @@ class Agent(object):
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
-        num_recent_pairs_to_protect: int = 1 # New parameter
+        num_recent_pairs_to_protect: int = 1, # New parameter
+        num_initial_pairs_to_protect: int = 1 # New parameter for initial pairs
     ):
         # An agent can be created from a Preset object
         if preset is not None:
@@ -344,6 +345,32 @@ class Agent(object):
         assert np, "NumPy import failed"
 
         self.num_recent_pairs_to_protect = num_recent_pairs_to_protect # Store the new parameter
+        self.num_initial_pairs_to_protect = num_initial_pairs_to_protect # Store the new initial pair protection parameter
+
+        # --- Recommended Fix: Disable LLM's ability to directly insert into archival memory ---
+        # This prioritizes the centroid-based archival as the primary mechanism
+        # Remove the function schema
+        original_function_count = len(self.functions)
+        self.functions = [f for f in self.functions if f.get("name") != "archival_memory_insert"]
+        if len(self.functions) < original_function_count:
+            printd("Removed 'archival_memory_insert' function schema from agent.")
+        # Remove the python function linkage
+        if "archival_memory_insert" in self.functions_python:
+            del self.functions_python["archival_memory_insert"]
+            printd("Removed 'archival_memory_insert' python function linkage from agent.")
+        # ----------------------------------------------------------------------------------
+
+    def _log_message_roles(self, message_list: Union[List[dict], List[Message]], context_label: str = "Current"):
+        """Helper function to log the sequence of message roles."""
+        roles = []
+        for msg in message_list:
+            if isinstance(msg, dict):
+                roles.append(msg.get("role"))
+            elif hasattr(msg, 'role'): # For Message objects
+                roles.append(msg.role)
+            else:
+                roles.append("unknown_type")
+        printd(f"MESSAGE ROLES ({context_label}, count: {len(roles)}): {roles}")
 
     @property
     def messages(self) -> List[dict]:
@@ -416,6 +443,8 @@ class Agent(object):
         first_message: bool = False,  # hint
     ) -> chat_completion_response.ChatCompletionResponse:
         """Get response from LLM API"""
+
+        self._log_message_roles(message_sequence, context_label="Before API Call") # Logging message roles
 
         # Log context window usage
         try:
@@ -706,11 +735,17 @@ class Agent(object):
             raise e
 
     def _archive_least_similar_context_pair(self):
-        printd(f"Attempting to archive least similar context pair (protecting last {self.num_recent_pairs_to_protect} pair(s))...")
+        # Calculate minimum number of actual pairs needed (initial protected + recent protected + 1 candidate)
+        min_pairs_needed_for_operation = self.num_initial_pairs_to_protect + self.num_recent_pairs_to_protect + 1
+        # Corresponding number of messages (pairs * 2) + 1 for system message
+        min_messages_for_operation = 1 + (2 * min_pairs_needed_for_operation)
 
-        min_messages_for_operation = 1 + (2 * self.num_recent_pairs_to_protect) + 2
+        printd(f"Attempting to archive least similar context pair (protecting first {self.num_initial_pairs_to_protect} pair(s) and last {self.num_recent_pairs_to_protect} pair(s))...")
+
         if len(self._messages) < min_messages_for_operation:
-            printd(f"Not enough messages ({len(self._messages)}, need {min_messages_for_operation}) for centroid archival with protection. Skipping.")
+            # printd(f"Not enough messages ({len(self._messages)}, need {min_messages_for_operation}) for centroid archival with protection. Skipping.")
+            printd(f"Not enough messages ({len(self._messages)}, need {min_messages_for_operation} for {min_pairs_needed_for_operation} pairs: "
+                   f"{self.num_initial_pairs_to_protect} initial, {self.num_recent_pairs_to_protect} recent, 1 candidate). Skipping centroid archival.")
             return
 
         all_identified_pairs_data = []
@@ -741,19 +776,30 @@ class Agent(object):
                 i += 1
         
         if not all_identified_pairs_data:
-            printd("No user-assistant pairs found in context. Skipping centroid archival.")
+            # printd("No user-assistant pairs found in context. Skipping centroid archival.")
+            printd("No user-assistant pairs found in context after scanning messages. Skipping centroid archival.")
             return
 
-        if self.num_recent_pairs_to_protect > 0 and len(all_identified_pairs_data) > self.num_recent_pairs_to_protect:
-            candidate_pairs_for_removal_data = all_identified_pairs_data[:-self.num_recent_pairs_to_protect]
-        elif self.num_recent_pairs_to_protect == 0:
-            candidate_pairs_for_removal_data = all_identified_pairs_data
-        else: # Not enough pairs to even exclude the protected ones, or only protected ones exist
-            printd(f"Not enough pairs ({len(all_identified_pairs_data)}) to select candidates beyond the {self.num_recent_pairs_to_protect} protected pairs. Skipping.")
-            return
+        # Determine the range of pairs eligible for removal
+        # These are indices for all_identified_pairs_data
+        start_idx_candidates = self.num_initial_pairs_to_protect
+        # This is the exclusive end index for the slice.
+        end_idx_candidates = len(all_identified_pairs_data) - self.num_recent_pairs_to_protect
 
-        if not candidate_pairs_for_removal_data or len(candidate_pairs_for_removal_data) < 1:
-            printd(f"Not enough candidate (non-protected) pairs ({len(candidate_pairs_for_removal_data)}) for centroid archival. Skipping.")
+        if start_idx_candidates >= end_idx_candidates:
+            printd(f"Not enough non-protected pairs to select candidates. "
+                   f"Total identified pairs: {len(all_identified_pairs_data)}, "
+                   f"Initial pairs to protect: {self.num_initial_pairs_to_protect}, "
+                   f"Recent pairs to protect: {self.num_recent_pairs_to_protect}. Skipping centroid archival.")
+            candidate_pairs_for_removal_data = []
+        else:
+            candidate_pairs_for_removal_data = all_identified_pairs_data[start_idx_candidates:end_idx_candidates]
+            printd(f"Identified {len(candidate_pairs_for_removal_data)} candidate pairs for removal "
+                   f"(from pair index {start_idx_candidates} to {end_idx_candidates - 1} of {len(all_identified_pairs_data)} total identified pairs).")
+
+        # Check if there are any candidates left to process
+        if not candidate_pairs_for_removal_data:
+            printd(f"No candidate pairs available for centroid archival after applying protections. Skipping.")
             return
 
         candidate_embeddings_list = [pair_data["embedding"] for pair_data in candidate_pairs_for_removal_data]
@@ -848,6 +894,7 @@ class Agent(object):
                         user_message_text_content = user_message.text
                         printd(f"User message text is not JSON, proceeding with raw text for name stripping: {user_message_text_content[:100]}")
 
+                    self._log_message_roles(self._messages, context_label="Step Start (User is Message Obj)") # Logging message roles
 
                     cleaned_user_message_text, name = strip_name_field_from_user_message(user_message_text_content)
 
@@ -873,10 +920,13 @@ class Agent(object):
                     )
                 else:
                     raise ValueError(f"Bad type for user_message: {type(user_message)}")
+                
+                self._log_message_roles(self._messages, context_label="Step Start (After User Message Processed, Before Appending to Input Seq)") # Logging message roles
 
                 self.interface.user_message(user_message.text, msg_obj=user_message)
                 input_message_sequence = self.messages + [user_message.to_openai_dict()]
             else:
+                self._log_message_roles(self._messages, context_label="Step Start (No User Message)") # Logging message roles
                 input_message_sequence = self.messages
 
             if len(input_message_sequence) > 1 and input_message_sequence[-1]["role"] != "user":
@@ -969,8 +1019,10 @@ class Agent(object):
             # ONLY if the memory warning threshold was just determined to be active from the last API call
             if active_memory_warning: # This flag is set based on current_total_tokens vs threshold
                 printd(f"Memory pressure threshold met (or was already high based on last API call), attempting centroid archival.")
+                self._log_message_roles(self._messages, context_label="Before Centroid Archival") # Logging message roles
                 try:
                     self._archive_least_similar_context_pair()
+                    self._log_message_roles(self._messages, context_label="After Centroid Archival") # Logging message roles
                 except Exception as e:
                     printd(f"CRITICAL Error during _archive_least_similar_context_pair: {e}")
                     traceback.print_exc()
