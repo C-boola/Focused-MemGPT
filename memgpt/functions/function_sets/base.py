@@ -147,17 +147,21 @@ def conversation_search_date(self: Agent, start_date: str, end_date: str, page: 
 
 def archival_memory_insert(self: Agent, content: str) -> Optional[str]:
     """
-    DEPRECATED: Memory archival is handled automatically based on context relevance. This function does nothing.
+    Allows the LLM to directly insert content into archival memory.
 
     Args:
-        content (str): Content that would have been written to memory (ignored).
+        content (str): Content to write to archival memory.
 
     Returns:
-        str: Message indicating archival is automatic.
+        str: Confirmation message.
     """
-    printd(f"LLM attempted to call deprecated archival_memory_insert with content='{content}'")
-    # Do nothing with the content
-    return "Memory archival is handled automatically based on context relevance. Function call ignored."
+    try:
+        self.persistence_manager.archival_memory.insert(content)
+        printd(f"LLM MANUALLY (archival_memory_insert) inserted content into archival memory: '{content[:100]}...'")
+        return "Content successfully inserted into archival memory."
+    except Exception as e:
+        printd(f"Error in archival_memory_insert: {str(e)}")
+        return f"Error inserting content into archival memory: {str(e)}"
 
 
 def archival_memory_search(self: Agent, query: str, page: Optional[int] = 0) -> Optional[str]:

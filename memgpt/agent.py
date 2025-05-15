@@ -194,7 +194,8 @@ class Agent(object):
         first_message_verify_mono: bool = True,  # TODO move to config?
         num_recent_pairs_to_protect: int = 1, # New parameter
         num_initial_pairs_to_protect: int = 1, # New parameter for initial pairs
-        allow_llm_archival_memory_insert: bool = True, # New flag to control LLM's archival_memory_insert
+        allow_llm_archival_memory_insert: bool = True, # Default to True to allow LLM to use archival_memory_insert
+        archival_mode: str = "fifo", # New parameter: "fifo" or "focus"
         log_step_embeddings: bool = False, # Flag to log all archival embeddings after each step
         embeddings_log_dir: Optional[str] = None # Directory for step embedding logs
     ):
@@ -352,6 +353,7 @@ class Agent(object):
         self.num_recent_pairs_to_protect = num_recent_pairs_to_protect # Store the new parameter
         self.num_initial_pairs_to_protect = num_initial_pairs_to_protect # Store the new initial pair protection parameter
         self.allow_llm_archival_memory_insert = allow_llm_archival_memory_insert
+        self.archival_mode = archival_mode # Store the new archival_mode parameter
         # Determine and set up logging parameters
         self.log_step_embeddings = True # Force True for your current testing needs
         
@@ -836,7 +838,7 @@ class Agent(object):
             printd(f"Error creating message embeddings: {e}")
             raise e
 
-    def _archive_least_similar_context_pair(self):
+    def _focus_archive_messages(self):
         # Calculate minimum number of actual pairs needed (initial protected + recent protected + 1 candidate)
         min_pairs_needed_for_operation = self.num_initial_pairs_to_protect + self.num_recent_pairs_to_protect + 1
         # Corresponding number of messages (pairs * 2) + 1 for system message
@@ -1187,98 +1189,6 @@ class Agent(object):
                 )
                 self.agent_alerted_about_memory_pressure = False # Reset persistent flag if below threshold
 
-            # Now, apply the centroid-based archival to the updated context
-            # ONLY if the memory warning threshold was just determined to be active from the last API call
-            if active_memory_warning: # This flag is set based on current_total_tokens vs threshold
-                printd(f"Memory pressure threshold met (or was already high based on last API call), attempting centroid archival.")
-                self._log_message_roles(self._messages, context_label="Before Centroid Archival")
-
-                # Log messages since last genuine user input
-                last_genuine_user_idx = -1
-                for idx in range(len(self._messages) - 1, -1, -1):
-                    msg = self._messages[idx]
-                    if msg.role == "user":
-                        is_system_generated_user_msg = False
-                        try:
-                            msg_json = json.loads(msg.text)
-                            if isinstance(msg_json, dict) and msg_json.get("type") in ["system_alert", "system_event"]:
-                                is_system_generated_user_msg = True
-                        except json.JSONDecodeError:
-                            pass # Not a JSON, so not one of these system types
-                        
-                        if msg.text.startswith("Summary of"):
-                            is_system_generated_user_msg = True
-                        
-                        if not is_system_generated_user_msg:
-                            last_genuine_user_idx = idx
-                            break
-                
-                if last_genuine_user_idx != -1:
-                    printd(f"--- Messages since last genuine user input (index {last_genuine_user_idx}) leading to archival attempt ---")
-                    for i in range(last_genuine_user_idx, len(self._messages)):
-                        msg_to_log = self._messages[i]
-                        content_snippet = msg_to_log.text.replace("\n", " ")[:100]
-                        if len(msg_to_log.text) > 100:
-                            content_snippet += "..."
-                        
-                        # Log message type and any additional metadata
-                        additional_info = ""
-                        if msg_to_log.role == "assistant" and msg_to_log.tool_calls:
-                            additional_info = f" (Tool Calls: {[tc.function['name'] for tc in msg_to_log.tool_calls]})"
-                        elif msg_to_log.role == "tool":
-                            additional_info = f" (Tool)"
-                        elif msg_to_log.role == "system":
-                            additional_info = f" (System)"
-                        elif msg_to_log.role == "user":
-                            # Try to detect if it's a system-generated message
-                            try:
-                                msg_json = json.loads(msg_to_log.text)
-                                if isinstance(msg_json, dict) and "type" in msg_json:
-                                    additional_info = f" (System-generated: {msg_json['type']})"
-                            except json.JSONDecodeError:
-                                pass
-
-                        print(f"  Idx {i}: Role='{msg_to_log.role}'{additional_info}, Content='{content_snippet}'")
-                    print(f"--------------------------------------------------------------------------------")
-                else:
-                    print("Could not find a previous genuine user message to log sequence from.")
-
-                archival_success = False
-                archived_content_summary = None # Initialize
-                try:
-                    # _archive_least_similar_context_pair now returns (bool, str_or_None)
-                    archival_success, archived_content_text = self._archive_least_similar_context_pair()
-                    if archival_success and archived_content_text:
-                        # Create a brief summary/snippet for the LLM
-                        snippet_length = 100 # Characters
-                        archived_content_summary = archived_content_text.replace("\n", " ")[:snippet_length]
-                        if len(archived_content_text) > snippet_length:
-                            archived_content_summary += "..."
-                    self._log_message_roles(self._messages, context_label="After Centroid Archival Attempt")
-                except Exception as e:
-                    printd(f"CRITICAL Error during _archive_least_similar_context_pair: {e}")
-                    traceback.print_exc()
-                
-                if archival_success:
-                    # event_details = f"A message pair was automatically archived. Content snippet: '{archived_content_summary}'"
-                    event_details = "An irrelevant message pair was automatically archived."
-                    system_event_content = {
-                        "type": "system_event",
-                        "event": "auto_archival_complete",
-                        "details": event_details
-                    }
-                    system_event_message_obj = Message.dict_to_message(
-                        agent_id=self.agent_state.id,
-                        user_id=self.agent_state.user_id,
-                        model=self.model,
-                        openai_message_dict={"role": "user", "content": json.dumps(system_event_content, ensure_ascii=JSON_ENSURE_ASCII)}
-                    )
-                    self._append_to_messages([system_event_message_obj])
-                    self._log_message_roles(self._messages, context_label="After Injecting Archival System Event")
-
-            else:
-                printd(f"Memory pressure threshold not met, skipping centroid archival.")
-
             self._trigger_archival_embeddings_log(log_reason="end_of_step")
             
             # Determine what messages to return to the caller (typically just the AI's output from this turn)
@@ -1294,11 +1204,29 @@ class Agent(object):
             traceback.print_exc() # Print full traceback for easier debugging of step failures
 
             if is_context_overflow_error(e):
-                printd("Context overflow error detected. Attempting to summarize messages inplace.")
-                self.summarize_messages_inplace()
+                printd("Context overflow error detected. Attempting to handle based on archival_mode.")
+                if self.archival_mode == "fifo":
+                    printd("Archival mode is FIFO. Attempting to summarize messages inplace.")
+                    self.summarize_messages_inplace()
+                    # self.agent_alerted_about_memory_pressure = False # Redundant, summarize_messages_inplace handles this
+                elif self.archival_mode == "focus":
+                    printd("Archival mode is FOCUS. Attempting to archive least similar context pair.")
+                    archival_success, _ = self._focus_archive_messages() # Use renamed function
+                    if archival_success:
+                        printd("Focus archival successful.")
+                        # Reset alert if focus archival did something that reduces pressure
+                        self.agent_alerted_about_memory_pressure = False 
+                    else:
+                        printd("Focus archival failed or did not remove messages. Falling back to summarization.")
+                        # Fallback to summarization if focus mode fails to make space
+                        self.summarize_messages_inplace()
+                        # self.agent_alerted_about_memory_pressure = False # Redundant
+                else: # Default or unknown mode, fallback to FIFO
+                    printd(f"Unknown archival_mode '{self.archival_mode}'. Defaulting to FIFO summarization.")
+                    self.summarize_messages_inplace()
+                    # self.agent_alerted_about_memory_pressure = False # Redundant
+                
                 # Try step again
-                # Need to ensure user_message is in the correct format for retry
-                # If user_message was an object, it should still be an object
                 return self.step(user_message, first_message=first_message, skip_verify=skip_verify, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
             else:
                 printd(f"step() failed with an unrecognized exception: '{str(e)}'")
