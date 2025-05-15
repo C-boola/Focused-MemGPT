@@ -6,6 +6,7 @@ from pathlib import Path
 import traceback
 from typing import List, Tuple, Optional, cast, Union
 from tqdm import tqdm
+import numpy as np
 
 from memgpt.metadata import MetadataStore
 from memgpt.agent_store.storage import StorageConnector, TableType
@@ -45,6 +46,7 @@ from memgpt.constants import (
 )
 from .errors import LLMError
 from .functions.functions import USER_FUNCTIONS_DIR, load_all_function_sets
+from memgpt.embeddings import create_message_pair_embeddings, calculate_centroid, calculate_cosine_distances
 
 
 def link_functions(function_schemas: list):
@@ -186,6 +188,7 @@ class Agent(object):
         name: Optional[str] = None,
         llm_config: Optional[LLMConfig] = None,
         embedding_config: Optional[EmbeddingConfig] = None,
+        mem_mode: Optional[str] = "focus",  # new memory mode parameter
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
@@ -212,8 +215,10 @@ class Agent(object):
                     "system": preset.system,
                     "functions": preset.functions_schema,
                     "messages": None,
+                    "mem_mode": mem_mode if mem_mode is not None else "focus", # Store mem_mode from preset creation
                 },
             )
+            self.mem_mode = mem_mode if mem_mode is not None else "focus"
 
         # An agent can also be created directly from AgentState
         elif agent_state is not None:
@@ -222,6 +227,7 @@ class Agent(object):
 
             # Assume the agent_state passed in is formatted correctly
             init_agent_state = agent_state
+            self.mem_mode = agent_state.state.get("mem_mode", "fifo") # Load mem_mode from state
 
         else:
             raise ValueError("Both Preset and AgentState were null (must provide one or the other)")
@@ -231,6 +237,7 @@ class Agent(object):
 
         # gpt-4, gpt-3.5-turbo, ...
         self.model = self.agent_state.llm_config.model
+        print(f"Agent '{self.agent_state.name}' is using LLM model: {self.model}")
 
         # Store the system instructions (used to rebuild memory)
         if "system" not in self.agent_state.state:
@@ -784,10 +791,133 @@ class Agent(object):
             # If we got a context alert, try trimming the messages length, then try again
             if is_context_overflow_error(e):
                 # A separate API call to run a summarizer
-                self.summarize_messages_inplace()
+                if self.mem_mode == "fifo":
+                    print("=" * 70)
+                    print("  ||  CONTEXT OVERFLOW - FIFO MODE ACTIVATED - PRE-SUMMARY DIAGNOSTICS  ||")
+                    print("=" * 70)
+                    
+                    original_user_message_text = user_message.text if isinstance(user_message, Message) else str(user_message)
+                    print(f"FIFO Pre-Summary: Original user_message causing overflow (text snippet): {original_user_message_text[:200]}...")
+                    print(f"FIFO Pre-Summary: Current self._messages count: {len(self._messages)}")
+                    current_messages_tokens = 0
+                    for i, msg_obj in enumerate(self._messages):
+                        role = msg_obj.role
+                        content_snippet = msg_obj.text[:100] if msg_obj.text else "[No text content]"
+                        msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
+                        current_messages_tokens += msg_tokens
+                        print(f"  [{i}] Role: {role}, ID: {msg_obj.id}, Tokens: {msg_tokens}, Content: '{content_snippet}...'")
+                    print(f"FIFO Pre-Summary: Total tokens in self._messages: {current_messages_tokens}")
+                    
+                    # Estimate tokens if current user_message was added
+                    user_message_tokens_for_diag = count_tokens(str(user_message.to_openai_dict() if isinstance(user_message, Message) else {"role": "user", "content": str(user_message)}))
+                    print(f"FIFO Pre-Summary: Tokens in current user_message: {user_message_tokens_for_diag}")
+                    print(f"FIFO Pre-Summary: Estimated total tokens IF user_message was appended (before summary): {current_messages_tokens + user_message_tokens_for_diag}")
+                    
+                    print(f"Context overflow in FIFO mode, calling summarize_messages_inplace().")
+                    self.summarize_messages_inplace()
+                    
+                    print("-" * 70)
+                    print("  ||  FIFO MODE - POST-SUMMARY DIAGNOSTICS (BEFORE RETRY)  ||")
+                    print("-" * 70)
+                    
+                    user_message_for_retry_text = user_message.text if isinstance(user_message, Message) else str(user_message)
+                    print(f"FIFO Post-Summary: User_message for retry (text snippet): {user_message_for_retry_text[:200]}...")
+                    print(f"FIFO Post-Summary: New self._messages count: {len(self._messages)}")
+                    new_messages_tokens = 0
+                    for i, msg_obj in enumerate(self._messages):
+                        role = msg_obj.role
+                        content_snippet = msg_obj.text[:100] if msg_obj.text else "[No text content]"
+                        msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
+                        new_messages_tokens += msg_tokens
+                        print(f"  [{i}] Role: {role}, ID: {msg_obj.id}, Tokens: {msg_tokens}, Content: '{content_snippet}...'")
+                    print(f"FIFO Post-Summary: Total tokens in new self._messages: {new_messages_tokens}")
+                    
+                    user_message_tokens_for_retry_diag = count_tokens(str(user_message.to_openai_dict() if isinstance(user_message, Message) else {"role": "user", "content": str(user_message)}))
+                    # This is the user_message that will be appended in the retry call
+                    print(f"FIFO Post-Summary: Tokens in user_message for retry: {user_message_tokens_for_retry_diag}")
+                    estimated_tokens_for_retry_api_call = new_messages_tokens + user_message_tokens_for_retry_diag
+                    print(f"FIFO Post-Summary: Estimated total tokens for API call in retry: {estimated_tokens_for_retry_api_call}")
+                    print(f"FIFO Post-Summary: LLM context window: {self.agent_state.llm_config.context_window}")
+                    
+                    # Try step again
+                    return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
+                elif self.mem_mode == "focus":
+                    print("=" * 50)
+                    print(" ||  CONTEXT OVERFLOW - FOCUS MODE ACTIVATED  ||")
+                    print("=" * 50)
+                    print(f"Context overflow in 'focus' mode. Attempting to generate message pair embeddings.")
+                    try:
+                        message_pair_embeddings_with_ids = create_message_pair_embeddings(
+                            message_sequence=self._messages, 
+                            embedding_config=self.agent_state.embedding_config
+                        )
+                        print(f"Generated {len(message_pair_embeddings_with_ids)} message pair embeddings for focus mode.")
 
-                # Try step again
-                return self.step(user_message, first_message=first_message, return_dicts=return_dicts)
+                        if not message_pair_embeddings_with_ids:
+                            print("No message pair embeddings generated. Defaulting to FIFO summarization or error.")
+                            # Decide: either call FIFO or re-raise. For now, re-raise as focus logic is incomplete.
+                            raise e 
+
+                        # Extract just the embedding vectors for centroid and distance calculation
+                        actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
+
+                        # Calculate centroid
+                        centroid_vec = calculate_centroid(actual_embedding_vectors)
+                        print('Centroid vector calculated successfully.')
+
+                        if centroid_vec is None:
+                            print("Centroid calculation failed (no vectors or other issue). Defaulting to FIFO or error.")
+                            raise e # Re-raise, focus logic incomplete
+                        
+                        # Convert list of list to list of np.array for distance calculation
+                        # Assuming calculate_cosine_distances expects list of np.array if not already handled inside
+                        # (current calculate_cosine_distances takes List[np.ndarray], so this conversion is good)
+                        np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
+                        distances = calculate_cosine_distances(centroid_vec, np_embedding_vectors)
+                        
+                        # Combine message IDs with their distances
+                        # Each element: (user_msg_id, assistant_msg_id, distance)
+                        messages_with_distances = []
+                        for i, pair_data in enumerate(message_pair_embeddings_with_ids):
+                            user_msg_id = pair_data[0]
+                            assistant_msg_id = pair_data[1]
+                            # pair_data[2] is the embedding itself, distances[i] is the calculated distance
+                            messages_with_distances.append({
+                                "user_msg_id": user_msg_id,
+                                "assistant_msg_id": assistant_msg_id,
+                                "distance": distances[i]
+                            })
+                        
+                        # Sort by distance, descending (furthest first)
+                        sorted_messages_by_distance = sorted(messages_with_distances, key=lambda x: x["distance"], reverse=True)
+                        
+                        print(f"Message pairs sorted by distance from centroid (furthest first):")
+                        for item in sorted_messages_by_distance:
+                            print(f"  User_ID: {item['user_msg_id']}, Asst_ID: {item['assistant_msg_id']}, Distance: {item['distance']:.4f}")
+
+                        # Implement summarization based on these sorted messages.
+                        try:
+                            self.summarize_messages_focus_inplace(sorted_messages_by_distance)
+                            # Try step again
+                            print("Focus mode: Summarization complete, retrying step.")
+                            return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
+                        except LLMError as focus_sum_e: # Catch specific error from our focus summarizer
+                            print(f"{CLI_WARNING_PREFIX}Focus mode summarization failed: {focus_sum_e}. Re-raising original overflow error to halt.")
+                            raise e # Re-raise the original overflow error (e, not focus_sum_e, to keep original trace if needed)
+                        except Exception as general_sum_e: # Catch any other unexpected error during summarization
+                            print(f"{CLI_WARNING_PREFIX}Unexpected error during focus mode summarization: {general_sum_e}. Re-raising original overflow error to halt.")
+                            raise e # Re-raise the original overflow error
+                        
+                    except Exception as emb_e:
+                        print(f"Error during focus mode context overflow handling (embedding/distance phase): {emb_e}")
+                        # If embedding generation or processing itself fails, re-raise the original overflow error.
+                        raise e # Re-raise the original overflow error
+                else:
+                    # Default to FIFO if mode is unrecognized
+                    print(f"Context overflow in unrecognized mem_mode '{self.mem_mode}', defaulting to FIFO summarization.")
+                    self.summarize_messages_inplace()
+                    # Try step again
+                    return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
             else:
                 printd(f"step() failed with an unrecognized exception: '{str(e)}'")
                 raise e
@@ -904,6 +1034,167 @@ class Agent(object):
         self.agent_alerted_about_memory_pressure = False
 
         printd(f"Ran summarizer, messages length {prior_len} -> {len(self.messages)}")
+
+    def summarize_messages_focus_inplace(self, sorted_messages_by_distance: List[dict]):
+        """Summarizes messages based on their distance from the conversation centroid.
+        
+        Removes message pairs (user and subsequent assistant) that are furthest from 
+        the centroid until the context window is sufficiently reduced.
+        The text of the removed messages is summarized and prepended to the context.
+        """
+        print("FOCUS MODE: Summarizing messages based on centroid distance.")
+        if not self._messages or len(self._messages) <= 1:  # Must have more than system message
+            raise LLMError("Focus summarize error: Not enough messages to process for summarization.")
+
+        # Ensure context window is known
+        if self.agent_state.llm_config.context_window is None:
+            print(f"{CLI_WARNING_PREFIX}Focus summarize: context_window missing in agent config, setting to default.")
+            self.agent_state.llm_config.context_window = (
+                LLM_MAX_TOKENS.get(self.model, LLM_MAX_TOKENS["DEFAULT"])
+            )
+        context_window = int(self.agent_state.llm_config.context_window)
+        target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+
+        # Calculate current total tokens from self._messages
+        current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Focus summarize: Current tokens: {current_total_tokens}, Target tokens after summarization: {target_token_count}")
+
+        tokens_to_free = current_total_tokens - target_token_count
+        if tokens_to_free <= 0:
+            print(f"Focus summarize: No tokens need to be freed (current: {current_total_tokens}, target: {target_token_count}). Skipping summarization.")
+            self.agent_alerted_about_memory_pressure = False  # Reset alert as we are "handling" it or it's not an issue
+            return
+
+        print(f"Focus summarize: Need to free approximately {tokens_to_free} tokens.")
+
+        message_ids_to_remove_set = set()
+        # Map message IDs to Message objects for quick lookup
+        message_id_to_message_obj = {msg.id: msg for msg in self._messages if msg.id is not None}
+
+        # Preserve last N messages: Get their IDs. System message is not part of this.
+        ids_to_preserve = set()
+        if MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST > 0:
+            # Consider only messages after the system prompt for preservation indexing
+            relevant_messages_for_preservation = [m for m in self._messages if m.role != "system"]
+            if len(relevant_messages_for_preservation) > MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST:
+                for i in range(1, MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST + 1):
+                    if relevant_messages_for_preservation[-i].id:
+                        ids_to_preserve.add(relevant_messages_for_preservation[-i].id)
+        print(f"Focus summarize: Preserving IDs of last {len(ids_to_preserve)} non-system messages: {ids_to_preserve}")
+
+        tokens_freed_so_far = 0
+        
+        # Store (user_msg_id, assistant_msg_id) tuples for messages selected
+        selected_pair_ids_for_summarization = [] 
+
+        for pair_info in sorted_messages_by_distance:  # Furthest first
+            user_msg_id = pair_info["user_msg_id"]
+            assistant_msg_id = pair_info["assistant_msg_id"]
+
+            # Skip if either message in the pair is in the preserve list
+            if user_msg_id in ids_to_preserve or assistant_msg_id in ids_to_preserve:
+                print(f"Focus summarize: Skipping pair (User: {user_msg_id}, Asst: {assistant_msg_id}) as it's in preserve list.")
+                continue
+            
+            # Skip if already marked for removal (e.g. if a message could somehow be part of two pairs - not current logic)
+            if user_msg_id in message_ids_to_remove_set or assistant_msg_id in message_ids_to_remove_set:
+                continue
+
+            user_msg_obj = message_id_to_message_obj.get(user_msg_id)
+            assistant_msg_obj = message_id_to_message_obj.get(assistant_msg_id)
+
+            if not user_msg_obj or not assistant_msg_obj:
+                print(f"{CLI_WARNING_PREFIX}Focus summarize: Could not find message objects for pair (User: {user_msg_id}, Asst: {assistant_msg_id}). Skipping.")
+                continue
+            
+            # Check if these are system messages (should not happen with current pair creation logic)
+            if user_msg_obj.role == "system" or assistant_msg_obj.role == "system":
+                print(f"{CLI_WARNING_PREFIX}Focus summarize: Attempted to select a system message in pair ({user_msg_id}, {assistant_msg_id}). Skipping.")
+                continue
+
+            pair_tokens = count_tokens(str(user_msg_obj.to_openai_dict())) + count_tokens(str(assistant_msg_obj.to_openai_dict()))
+            
+            message_ids_to_remove_set.add(user_msg_id)
+            message_ids_to_remove_set.add(assistant_msg_id)
+            selected_pair_ids_for_summarization.append({'user':user_msg_id, 'assistant':assistant_msg_id}) # Store for chronological collection
+            tokens_freed_so_far += pair_tokens
+            
+            print(f"Focus summarize: Tentatively selected pair (User: {user_msg_id}, Asst: {assistant_msg_id}) for summarization. Tokens in pair: {pair_tokens}. Total tokens potentially freed: {tokens_freed_so_far}")
+
+            if tokens_freed_so_far >= tokens_to_free:
+                break
+        
+        if not message_ids_to_remove_set:
+            print(f"{CLI_WARNING_PREFIX}Focus summarize: No messages selected for summarization. This might be due to all distant messages being protected by 'preserve_last_N', or too few messages overall.")
+            # If we can't free space, we can't proceed. The agent will likely hit the context error again.
+            # Raise an error to indicate failure to reduce context via this method.
+            raise LLMError("Focus summarize: Failed to select any messages for summarization to reduce context pressure.")
+
+        # Collect the actual message dicts for the summarizer, in CHRONOLOGICAL order
+        actual_messages_for_summarizer_chronological = []
+        # Iterate through the original self._messages to maintain order
+        for msg_obj in self._messages:
+            if msg_obj.id in message_ids_to_remove_set:
+                actual_messages_for_summarizer_chronological.append(msg_obj.to_openai_dict())
+        
+        if not actual_messages_for_summarizer_chronological:
+             raise LLMError("Focus summarize: Messages were marked for removal, but could not be collected for the summarizer. Internal logic error.")
+
+        print(f"Focus summarize: Summarizing {len(actual_messages_for_summarizer_chronological)} individual messages from ({len(message_ids_to_remove_set)//2} pairs), in chronological order.")
+        summary_text = summarize_messages(
+            agent_state=self.agent_state,
+            message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+        )
+        print(f"Focus summarize: Got summary: {summary_text}")
+
+        # Package summary message using the standard utility
+        # We need to calculate how many messages are "hidden" by this summary.
+        # For package_summarize_message:
+        # summary_message_count = len(actual_messages_for_summarizer_chronological)
+        # hidden_message_count could be more complex; it refers to all messages not in current window + those being summarized now.
+        # Let's use a simplified approach for now, or use the structure from summarize_messages_inplace
+        
+        num_original_messages_summarized = len(actual_messages_for_summarizer_chronological)
+        # This is a rough estimate for 'hidden_message_count' for the purpose of the summary string
+        # A more accurate count would involve looking at total persisted messages vs current.
+        # For now, let's consider 'hidden' as those we just summarized.
+        # The existing `package_summarize_message` is tied to FIFO logic's view of history.
+        # We will create a slightly different summary string for focus mode.
+        summary_insert_content = f"[Focus Summary: condensed {num_original_messages_summarized} prior messages that were less central to the recent conversation flow]:\n{summary_text}"
+
+        summary_message_to_prepend = Message.dict_to_message(
+            agent_id=self.agent_state.id,
+            user_id=self.agent_state.user_id,
+            model=self.model, 
+            openai_message_dict={"role": "user", "content": summary_insert_content} # Role 'user' is common for injected summaries
+        )
+        
+        # Remove the selected messages from self._messages and persistence manager
+        original_message_count = len(self._messages)
+        new_messages_list = [msg for msg in self._messages if msg.id not in message_ids_to_remove_set]
+        
+        if isinstance(self.persistence_manager, LocalStateManager):
+            deleted_count_pm = 0
+            for msg_id_to_delete in message_ids_to_remove_set:
+                try:
+                    if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
+                        self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
+                        deleted_count_pm +=1
+                except Exception as del_e:
+                    print(f"{CLI_WARNING_PREFIX}Focus summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
+            print(f"Focus summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
+        else:
+            print(f"{CLI_WARNING_PREFIX}Focus summarize: Persistence manager is not LocalStateManager or compatible; selective deletion from PM might not occur. Message list in AgentState will be updated.")
+
+        self._messages = new_messages_list
+        
+        # Prepend the summary message (this also handles persistence of the new summary message)
+        self._prepend_to_messages([summary_message_to_prepend])
+        
+        self.agent_alerted_about_memory_pressure = False
+        
+        final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Focus summarize: Completed. Original messages: {original_message_count}, New messages: {len(self._messages)}. Original tokens: {current_total_tokens}, Approx Freed: {tokens_freed_so_far}, Final tokens: {final_token_count}.")
 
     def heartbeat_is_paused(self):
         """Check if there's a requested pause on timed heartbeats"""
@@ -1029,6 +1320,7 @@ class Agent(object):
             "system": self.system,
             "functions": self.functions,
             "messages": [str(msg.id) for msg in self._messages],
+            "mem_mode": self.mem_mode,  # Persist mem_mode
         }
 
         self.agent_state = AgentState(

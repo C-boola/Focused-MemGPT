@@ -8,6 +8,7 @@ TOOL_CALL_ID_MAX_LEN = 29
 
 # embeddings
 MAX_EMBEDDING_DIM = 4096  # maximum supported embeding size - do NOT change or else DBs will need to be reset
+DEFAULT_EMBEDDING_MODEL = "text-embedding-ada-002"
 
 # tokenizers
 EMBEDDING_TO_TOKENIZER_MAP = {
