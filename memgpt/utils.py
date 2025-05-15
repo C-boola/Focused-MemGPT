@@ -774,11 +774,11 @@ def count_tokens(s: str, model: str = "gpt-4") -> int:
     try:
         encoding = tiktoken.encoding_for_model(model)
     except KeyError:
-        print(f"Warning: Failed to get encoding for model {model}. Using cl100k_base encoding.")
+        # print(f"Warning: Failed to get encoding for model {model}. Using cl100k_base encoding.")
         encoding = tiktoken.get_encoding("cl100k_base")
     except Exception as e:
         # Fallback for any other error during encoding retrieval
-        print(f"Warning: Failed to get tiktoken encoding for model {model} ({e}). Using cl100k_base encoding.")
+        # print(f"Warning: Failed to get tiktoken encoding for model {model} ({e}). Using cl100k_base encoding.")
         encoding = tiktoken.get_encoding("cl100k_base")
         
     return len(encoding.encode(s))

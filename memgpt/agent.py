@@ -7,6 +7,8 @@ import traceback
 from typing import List, Tuple, Optional, cast, Union
 from tqdm import tqdm
 import numpy as np
+import os
+import datetime
 
 from memgpt.metadata import MetadataStore
 from memgpt.agent_store.storage import StorageConnector, TableType
@@ -191,7 +193,10 @@ class Agent(object):
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
         num_recent_pairs_to_protect: int = 1, # New parameter
-        num_initial_pairs_to_protect: int = 1 # New parameter for initial pairs
+        num_initial_pairs_to_protect: int = 1, # New parameter for initial pairs
+        allow_llm_archival_memory_insert: bool = True, # New flag to control LLM's archival_memory_insert
+        log_step_embeddings: bool = False, # Flag to log all archival embeddings after each step
+        embeddings_log_dir: Optional[str] = None # Directory for step embedding logs
     ):
         # An agent can be created from a Preset object
         if preset is not None:
@@ -346,19 +351,33 @@ class Agent(object):
 
         self.num_recent_pairs_to_protect = num_recent_pairs_to_protect # Store the new parameter
         self.num_initial_pairs_to_protect = num_initial_pairs_to_protect # Store the new initial pair protection parameter
+        self.allow_llm_archival_memory_insert = allow_llm_archival_memory_insert
+        # Determine and set up logging parameters
+        self.log_step_embeddings = True # Force True for your current testing needs
+        
+        if embeddings_log_dir is None:
+            if self.agent_state and hasattr(self.agent_state, 'id') and self.agent_state.id:
+                self.embeddings_log_dir = Path(".") / "agent_step_embedding_logs" / str(self.agent_state.id)
+                print(f"AGENT_INIT_DEBUG: embeddings_log_dir not specified, defaulting to local: {self.embeddings_log_dir}")
+            else:
+                self.embeddings_log_dir = Path(".") / "agent_step_embedding_logs" / "unknown_agent"
+                print(f"AGENT_INIT_WARNING: Agent ID not available for default embeddings_log_dir, using 'unknown_agent'. Check agent_state initialization.")
+        else:
+            self.embeddings_log_dir = Path(embeddings_log_dir)
+        
+        self.step_count = 0 # For unique naming of step embedding logs
 
-        # --- Recommended Fix: Disable LLM's ability to directly insert into archival memory ---
-        # This prioritizes the centroid-based archival as the primary mechanism
-        # Remove the function schema
-        original_function_count = len(self.functions)
-        self.functions = [f for f in self.functions if f.get("name") != "archival_memory_insert"]
-        if len(self.functions) < original_function_count:
-            printd("Removed 'archival_memory_insert' function schema from agent.")
-        # Remove the python function linkage
-        if "archival_memory_insert" in self.functions_python:
-            del self.functions_python["archival_memory_insert"]
-            printd("Removed 'archival_memory_insert' python function linkage from agent.")
-        # ----------------------------------------------------------------------------------
+        # Conditionally remove archival_memory_insert if the flag is False
+        if not self.allow_llm_archival_memory_insert:
+            if "archival_memory_insert" in self.functions_python:
+                self.functions = [f for f in self.functions if f.get("name") != "archival_memory_insert"]
+                del self.functions_python["archival_memory_insert"]
+                printd("LLM direct archival_memory_insert is DISABLED by agent config.")
+            else:
+                # This case might occur if the function was never loaded or already removed, which is fine.
+                printd("LLM direct archival_memory_insert is DISABLED, but was not found in current functions list.")
+        else:
+            printd("LLM direct archival_memory_insert is ENABLED by agent config.")
 
     def _log_message_roles(self, message_list: Union[List[dict], List[Message]], context_label: str = "Current"):
         """Helper function to log the sequence of message roles."""
@@ -453,11 +472,90 @@ class Agent(object):
                 prompt_tokens = count_tokens(json.dumps(message_sequence), self.model)
             except Exception as e:
                 # If it fails (e.g., unknown model), fallback to a default tokenizer
-                print(f"Warning: count_tokens failed for model {self.model} ({e}), falling back to cl100k_base tokenizer.")
+                # print(f"Warning: count_tokens failed for model {self.model} ({e}), falling back to cl100k_base tokenizer.")
                 prompt_tokens = count_tokens(json.dumps(message_sequence), "cl100k_base")
                 
             model_context_window = LLM_MAX_TOKENS.get(self.model) or LLM_MAX_TOKENS["DEFAULT"]
             print(f"CONTEXT: Using {prompt_tokens}/{model_context_window} tokens for model {self.model}")
+
+            # Detailed token breakdown
+            print("DETAILED CONTEXT TOKEN BREAKDOWN:")
+            role_token_counts = {} 
+            individual_message_details = []
+            tokenizer_model_for_parts = self.model
+            tokenizer_endpoint_type_for_parts = self.agent_state.llm_config.model_endpoint_type
+            tokenizer_failed_for_parts = False
+
+            for i, msg_dict in enumerate(message_sequence):
+                role = msg_dict.get("role", "unknown")
+                current_msg_parts_tokens = 0
+                msg_display_parts = []
+
+                # Helper to count tokens for a part, with fallback
+                def count_part_tokens(text_to_count: str) -> int:
+                    nonlocal tokenizer_failed_for_parts, tokenizer_model_for_parts, tokenizer_endpoint_type_for_parts
+                    try:
+                        if tokenizer_failed_for_parts: # If already failed, use fallback for all subsequent parts
+                            return count_tokens(text_to_count, "cl100k_base")
+                        return count_tokens(text_to_count, tokenizer_model_for_parts, tokenizer_endpoint_type_for_parts)
+                    except Exception as count_exc:
+                        if not tokenizer_failed_for_parts: # First time failing for parts
+                            print(f"Warning: count_tokens for message parts failed for model {tokenizer_model_for_parts} (endpoint type: {tokenizer_endpoint_type_for_parts}). Error: {count_exc}. Falling back to cl100k_base for this and subsequent parts.")
+                            tokenizer_failed_for_parts = True
+                        # Use cl100k_base as fallback
+                        return count_tokens(text_to_count, "cl100k_base")
+
+                # 1. Content
+                if "content" in msg_dict and msg_dict["content"] is not None:
+                    content_str = str(msg_dict["content"]) # Ensure string
+                    tokens = count_part_tokens(content_str)
+                    current_msg_parts_tokens += tokens
+                    snippet = content_str.replace("\\n", " ")[:60]
+                    if len(content_str) > 60: snippet += "..."
+                    msg_display_parts.append(f"content: \"{snippet}\" ({tokens} t)")
+                elif "content" in msg_dict and msg_dict["content"] is None: # Explicit None content
+                     msg_display_parts.append(f"content: null (0 t)")
+
+                # 2. Tool Calls
+                if "tool_calls" in msg_dict and msg_dict["tool_calls"]:
+                    tool_calls_data = msg_dict["tool_calls"]
+                    tool_calls_str_for_tokens = json.dumps(tool_calls_data, ensure_ascii=JSON_ENSURE_ASCII)
+                    tokens = count_part_tokens(tool_calls_str_for_tokens)
+                    current_msg_parts_tokens += tokens
+                    func_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls_data]
+                    msg_display_parts.append(f"tool_calls: {func_names} ({tokens} t)")
+
+                # 3. Function Call (older, deprecated)
+                if "function_call" in msg_dict and msg_dict["function_call"]:
+                    function_call_data = msg_dict["function_call"]
+                    function_call_str_for_tokens = json.dumps(function_call_data, ensure_ascii=JSON_ENSURE_ASCII)
+                    tokens = count_part_tokens(function_call_str_for_tokens)
+                    current_msg_parts_tokens += tokens
+                    func_name = function_call_data.get("name", "?")
+                    msg_display_parts.append(f"function_call: {func_name} ({tokens} t)")
+                
+                # 4. Name (for user/assistant/tool messages if present)
+                if "name" in msg_dict and msg_dict["name"] is not None:
+                    name_str = str(msg_dict["name"])
+                    tokens = count_part_tokens(name_str)
+                    current_msg_parts_tokens += tokens
+                    msg_display_parts.append(f"name: \"{name_str}\" ({tokens} t)")
+
+                role_token_counts[role] = role_token_counts.get(role, 0) + current_msg_parts_tokens
+                individual_message_details.append(
+                    f"  Msg {i:<3} Role: {role:<10} | Parts Sum: {current_msg_parts_tokens:<5} t | Details: [{'; '.join(msg_display_parts)}]"
+                )
+
+            print("  Role-based token sums (from message parts):")
+            for role_name, total_role_tokens in sorted(role_token_counts.items()):
+                print(f"    {role_name:<10}: {total_role_tokens} t")
+            
+            details_tokenizer_name = tokenizer_model_for_parts if not tokenizer_failed_for_parts else 'cl100k_base (fallback)'
+            # print(f"  Individual message details (parts tokenized using {details_tokenizer_name}):")
+            # for detail_line in individual_message_details:
+            #     print(detail_line)
+            print("-" * 40) # Separator after detailed breakdown
+
         except Exception as e:
             # Catch any other unexpected errors during logging
             print(f"Warning: Could not calculate and log token count - {e}")
@@ -662,6 +760,10 @@ class Agent(object):
             self.interface.function_message(f"Ran {function_name}({function_args})", msg_obj=messages[-1])
             self.interface.function_message(f"Success: {function_response_string}", msg_obj=messages[-1])
 
+            # If the successful function was archival_memory_insert, log embeddings
+            if function_name == "archival_memory_insert" and not function_failed: # function_failed should be false here anyway
+                self._trigger_archival_embeddings_log(log_reason="llm_archival_insert")
+
         else:
             # Standard non-function reply
             messages.append(
@@ -743,45 +845,91 @@ class Agent(object):
         printd(f"Attempting to archive least similar context pair (protecting first {self.num_initial_pairs_to_protect} pair(s) and last {self.num_recent_pairs_to_protect} pair(s))...")
 
         if len(self._messages) < min_messages_for_operation:
-            # printd(f"Not enough messages ({len(self._messages)}, need {min_messages_for_operation}) for centroid archival with protection. Skipping.")
             printd(f"Not enough messages ({len(self._messages)}, need {min_messages_for_operation} for {min_pairs_needed_for_operation} pairs: "
                    f"{self.num_initial_pairs_to_protect} initial, {self.num_recent_pairs_to_protect} recent, 1 candidate). Skipping centroid archival.")
-            return
+            return False, None
 
         all_identified_pairs_data = []
         
         i = 1 
-        while i < len(self._messages) - 1:
+        while i < len(self._messages) - 1: # Need at least current_msg and next_msg
             current_msg = self._messages[i]
             next_msg = self._messages[i+1]
+
             if current_msg.role == "user" and next_msg.role == "assistant":
-                user_msg_obj = current_msg
-                assistant_msg_obj = next_msg
+                is_protected_special_user_message = False
+                
+                # Robust check for system alert by parsing JSON
                 try:
-                    combined_texts = self.create_message_pair_embeddings(user_msg_obj, [assistant_msg_obj])
-                    if not combined_texts:
-                        i += 1; continue
-                    combined_text = "\\n".join(combined_texts)
-                    embedding = self.persistence_manager.embedding_model.get_text_embedding(combined_text)
-                    all_identified_pairs_data.append({
-                        "user_msg": user_msg_obj, "assistant_msg": assistant_msg_obj,
-                        "user_idx": i, "assistant_idx": i + 1,
-                        "embedding": np.array(embedding)
-                    })
+                    msg_json = json.loads(current_msg.text)
+                    if isinstance(msg_json, dict) and msg_json.get("type") == "system_alert":
+                        is_protected_special_user_message = True
+                        printd(f"PROTECTED_USER_MESSAGE (type: system_alert via JSON parse, index: {i}) and its assistant pair (index {i+1}) will not be considered for archival.")
+                except json.JSONDecodeError:
+                    # Not a JSON message, or malformed JSON - it's not a system_alert of the expected format.
+                    pass # Proceed to other checks
+
+                # Check for summarization message (if not already protected as a system_alert)
+                if not is_protected_special_user_message and current_msg.text.startswith("Summary of"):
+                    is_protected_special_user_message = True
+                    printd(f"PROTECTED_USER_MESSAGE (type: summary, index: {i}) and its assistant pair (index {i+1}) will not be considered for archival.")
+
+                if not is_protected_special_user_message:
+                    # This is a regular user-assistant pair, add it as a candidate
+                    try:
+                        # create_message_pair_embeddings expects Message objects, which current_msg and next_msg are.
+                        combined_texts = self.create_message_pair_embeddings(current_msg, [next_msg])
+                        if not combined_texts: # Should not happen if inputs are valid
+                            i += 1 # Could not embed, advance past current_msg
+                            continue 
+                        combined_text = "\n".join(combined_texts)
+                        embedding = self.persistence_manager.embedding_model.get_text_embedding(combined_text)
+                        # Save embedding as numpy array with timestamp in filename
+                        if self.log_step_embeddings and embedding is not None:
+                            
+                            
+                            # Create directory if it doesn't exist
+                            embeddings_dir = self.embeddings_log_dir or "stored_vector_embeddings"
+                            os.makedirs(embeddings_dir, exist_ok=True)
+                            
+                            # Generate filename with timestamp
+                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                            filename = f"embedding_pair_{i}_{i+1}_{timestamp}.npy"
+                            filepath = os.path.join(embeddings_dir, filename)
+                            
+                            # Save the embedding as numpy array
+                            np.save(filepath, np.array(embedding))
+                            
+                            # Also save the combined text with the same filename but .json extension
+                            json_filename = f"embedding_pair_{i}_{i+1}_{timestamp}.json"
+                            json_filepath = os.path.join(embeddings_dir, json_filename)
+                            with open(json_filepath, 'w', encoding='utf-8') as f:
+                                json.dump({"text": combined_text}, f, ensure_ascii=False, indent=2)
+                            
+                            printd(f"Saved embedding to {filepath} and text to {json_filepath}")
+                        # print(f"DEBUG: Embedding for pair (user_idx {i}, assistant_idx {i+1}): {np.array(embedding)}")
+
+                        all_identified_pairs_data.append({
+                            "user_msg": current_msg, "assistant_msg": next_msg,
+                            "user_idx": i, "assistant_idx": i + 1,
+                            "embedding": np.array(embedding)
+                        })
+                        i += 2 # Successfully processed this pair, move to the message after next_msg
+                    except Exception as e:
+                        printd(f"Error embedding a pair for centroid consideration (user_idx {i}, assistant_idx {i+1}): {e}")
+                        i += 1 # Error, advance past current_msg to be safe
+                else:
+                    # This was a protected special user message, skip this pair by advancing past it and its assistant partner
                     i += 2 
-                except Exception as e:
-                    printd(f"Error embedding a pair for centroid consideration: {e}")
-                    i += 1 
             else:
+                # Not a user-assistant pair, advance past current_msg
                 i += 1
         
         if not all_identified_pairs_data:
-            # printd("No user-assistant pairs found in context. Skipping centroid archival.")
-            printd("No user-assistant pairs found in context after scanning messages. Skipping centroid archival.")
-            return
+            printd("No suitable user-assistant pairs found in context for centroid archival after applying protections. Skipping.")
+            return False, None
 
-        # Determine the range of pairs eligible for removal
-        # These are indices for all_identified_pairs_data
+        # Determine the range of pairs eligible for removal from all_identified_pairs_data
         start_idx_candidates = self.num_initial_pairs_to_protect
         # This is the exclusive end index for the slice.
         end_idx_candidates = len(all_identified_pairs_data) - self.num_recent_pairs_to_protect
@@ -800,43 +948,60 @@ class Agent(object):
         # Check if there are any candidates left to process
         if not candidate_pairs_for_removal_data:
             printd(f"No candidate pairs available for centroid archival after applying protections. Skipping.")
-            return
+            return False, None
 
         candidate_embeddings_list = [pair_data["embedding"] for pair_data in candidate_pairs_for_removal_data]
         
         if not candidate_embeddings_list:
             printd("No embeddings from candidate pairs to calculate centroid. Skipping.")
-            return
+            return False, None
             
         centroid = np.mean(candidate_embeddings_list, axis=0)
+        # self.store_centroid(centroid) # Potentially store centroid if a removal happens based on it was successful
 
-        furthest_distance = -1.0
-        furthest_candidate_pair_details = None
-
+        distances_and_pairs = []
         for pair_data_item in candidate_pairs_for_removal_data:
             distance = np.linalg.norm(pair_data_item["embedding"] - centroid)
-            if distance > furthest_distance:
-                furthest_distance = distance
-                furthest_candidate_pair_details = pair_data_item
+            distances_and_pairs.append({"distance": distance, "data": pair_data_item})
+            
+        distances_and_pairs.sort(key=lambda x: x["distance"], reverse=True)
+
+        selected_pair_for_archival = None
+        for item in distances_and_pairs:
+            current_pair_data = item["data"]
+            u_idx = current_pair_data["user_idx"]
+            a_idx = current_pair_data["assistant_idx"]
+
+            safe_to_remove = True
+            if u_idx > 0 and (a_idx + 1) < len(self._messages):
+                prev_message_role = self._messages[u_idx - 1].role
+                next_message_role = self._messages[a_idx + 1].role
+                if prev_message_role == "assistant" and next_message_role == "assistant":
+                    safe_to_remove = False
+                    printd(f"STRUCTURAL WARNING: Skipping removal of pair (user index {u_idx}, assistant index {a_idx}) to avoid assistant-assistant sequence.")
+            
+            if safe_to_remove:
+                selected_pair_for_archival = current_pair_data
+                printd(f"STRUCTURALLY SAFE: Selected pair (user index {u_idx}, assistant index {a_idx}) for archival.")
+                break 
                 
-        if furthest_candidate_pair_details is None:
-            printd("Could not identify a furthest candidate pair from centroid. Skipping.")
-            return
+        if selected_pair_for_archival is None:
+            printd("Could not identify a structurally safe candidate pair from centroid for archival. Skipping this step.")
+            # return False
+            return False, None # Indicate no archival, no content
 
-        removed_user_msg = furthest_candidate_pair_details["user_msg"]
-        removed_assistant_msg = furthest_candidate_pair_details["assistant_msg"]
-
+        removed_user_msg = selected_pair_for_archival["user_msg"]
+        removed_assistant_msg = selected_pair_for_archival["assistant_msg"]
         content_to_archive = f"User: {removed_user_msg.text}\\nAssistant: {removed_assistant_msg.text}"
-
-        print(f"AUTO-ARCHIVING (least similar candidate to centroid): User message (original context index {furthest_candidate_pair_details['user_idx']}): {removed_user_msg.text}")
-        print(f"AUTO-ARCHIVING (least similar candidate to centroid): Assistant message (original context index {furthest_candidate_pair_details['assistant_idx']}): {removed_assistant_msg.text}")
 
         try:
             self.persistence_manager.archival_memory.insert(content_to_archive)
-            printd(f"Successfully triggered archival insertion for least similar candidate pair.")
+            # self.store_centroid(centroid) # Store centroid if archival based on it was successful
+            printd(f"Successfully triggered archival insertion for: User: {removed_user_msg.text[:50]}... | Assistant: {removed_assistant_msg.text[:50]}...")
         except Exception as e:
             printd(f"CRITICAL Error calling archival_memory.insert for least similar candidate pair: {e}")
             traceback.print_exc()
+            return False, None # Indicate no archival, no content
 
         ids_to_remove_from_context = {removed_user_msg.id, removed_assistant_msg.id}
         original_len = len(self._messages)
@@ -844,10 +1009,16 @@ class Agent(object):
         removed_count = original_len - len(self._messages)
 
         if removed_count > 0:
-            printd(f"Removed {removed_count} messages from active context after auto-archival of outlier candidate.")
+            print(f"AUTO-ARCHIVING (structurally safe, furthest from centroid): User message (original context index {selected_pair_for_archival['user_idx']}): {removed_user_msg.text}")
+            print(f"AUTO-ARCHIVING (structurally safe, furthest from centroid): Assistant message (original context index {selected_pair_for_archival['assistant_idx']}): {removed_assistant_msg.text}")
+            printd(f"Removed {removed_count} messages from active context after auto-archival.")
             self.update_state()
+            self._trigger_archival_embeddings_log(log_reason="auto_archival") # Log after successful auto-archival
+            return True, content_to_archive 
         else:
-            printd("No messages were removed by candidate centroid logic (IDs might not have matched).")
+            printd("Warning: Archival insertion succeeded, but no messages were removed from active context.")
+            # return False
+            return False, None # Indicate no archival, no content
 
     def step(
         self,
@@ -975,6 +1146,7 @@ class Agent(object):
                         passage = self.persistence_manager.archival_memory.create_passage(combined_text, embedding) # create_passage is on ArchivalMemory
                         self.persistence_manager.vector_store.insert(passage)
                         printd(f"Automatically embedded and stored current user-assistant turn ({current_pair_user_msg.id}, {current_pair_assistant_msg.id}) to vector store.")
+                        self._trigger_archival_embeddings_log(log_reason="turn_embedding") # Log after successful turn embedding
                 except Exception as e:
                     printd(f"Error in automatic embedding of current turn: {e}")
             
@@ -1019,16 +1191,96 @@ class Agent(object):
             # ONLY if the memory warning threshold was just determined to be active from the last API call
             if active_memory_warning: # This flag is set based on current_total_tokens vs threshold
                 printd(f"Memory pressure threshold met (or was already high based on last API call), attempting centroid archival.")
-                self._log_message_roles(self._messages, context_label="Before Centroid Archival") # Logging message roles
+                self._log_message_roles(self._messages, context_label="Before Centroid Archival")
+
+                # Log messages since last genuine user input
+                last_genuine_user_idx = -1
+                for idx in range(len(self._messages) - 1, -1, -1):
+                    msg = self._messages[idx]
+                    if msg.role == "user":
+                        is_system_generated_user_msg = False
+                        try:
+                            msg_json = json.loads(msg.text)
+                            if isinstance(msg_json, dict) and msg_json.get("type") in ["system_alert", "system_event"]:
+                                is_system_generated_user_msg = True
+                        except json.JSONDecodeError:
+                            pass # Not a JSON, so not one of these system types
+                        
+                        if msg.text.startswith("Summary of"):
+                            is_system_generated_user_msg = True
+                        
+                        if not is_system_generated_user_msg:
+                            last_genuine_user_idx = idx
+                            break
+                
+                if last_genuine_user_idx != -1:
+                    printd(f"--- Messages since last genuine user input (index {last_genuine_user_idx}) leading to archival attempt ---")
+                    for i in range(last_genuine_user_idx, len(self._messages)):
+                        msg_to_log = self._messages[i]
+                        content_snippet = msg_to_log.text.replace("\n", " ")[:100]
+                        if len(msg_to_log.text) > 100:
+                            content_snippet += "..."
+                        
+                        # Log message type and any additional metadata
+                        additional_info = ""
+                        if msg_to_log.role == "assistant" and msg_to_log.tool_calls:
+                            additional_info = f" (Tool Calls: {[tc.function['name'] for tc in msg_to_log.tool_calls]})"
+                        elif msg_to_log.role == "tool":
+                            additional_info = f" (Tool)"
+                        elif msg_to_log.role == "system":
+                            additional_info = f" (System)"
+                        elif msg_to_log.role == "user":
+                            # Try to detect if it's a system-generated message
+                            try:
+                                msg_json = json.loads(msg_to_log.text)
+                                if isinstance(msg_json, dict) and "type" in msg_json:
+                                    additional_info = f" (System-generated: {msg_json['type']})"
+                            except json.JSONDecodeError:
+                                pass
+
+                        print(f"  Idx {i}: Role='{msg_to_log.role}'{additional_info}, Content='{content_snippet}'")
+                    print(f"--------------------------------------------------------------------------------")
+                else:
+                    print("Could not find a previous genuine user message to log sequence from.")
+
+                archival_success = False
+                archived_content_summary = None # Initialize
                 try:
-                    self._archive_least_similar_context_pair()
-                    self._log_message_roles(self._messages, context_label="After Centroid Archival") # Logging message roles
+                    # _archive_least_similar_context_pair now returns (bool, str_or_None)
+                    archival_success, archived_content_text = self._archive_least_similar_context_pair()
+                    if archival_success and archived_content_text:
+                        # Create a brief summary/snippet for the LLM
+                        snippet_length = 100 # Characters
+                        archived_content_summary = archived_content_text.replace("\n", " ")[:snippet_length]
+                        if len(archived_content_text) > snippet_length:
+                            archived_content_summary += "..."
+                    self._log_message_roles(self._messages, context_label="After Centroid Archival Attempt")
                 except Exception as e:
                     printd(f"CRITICAL Error during _archive_least_similar_context_pair: {e}")
                     traceback.print_exc()
+                
+                if archival_success:
+                    # event_details = f"A message pair was automatically archived. Content snippet: '{archived_content_summary}'"
+                    event_details = "An irrelevant message pair was automatically archived."
+                    system_event_content = {
+                        "type": "system_event",
+                        "event": "auto_archival_complete",
+                        "details": event_details
+                    }
+                    system_event_message_obj = Message.dict_to_message(
+                        agent_id=self.agent_state.id,
+                        user_id=self.agent_state.user_id,
+                        model=self.model,
+                        openai_message_dict={"role": "user", "content": json.dumps(system_event_content, ensure_ascii=JSON_ENSURE_ASCII)}
+                    )
+                    self._append_to_messages([system_event_message_obj])
+                    self._log_message_roles(self._messages, context_label="After Injecting Archival System Event")
+
             else:
                 printd(f"Memory pressure threshold not met, skipping centroid archival.")
 
+            self._trigger_archival_embeddings_log(log_reason="end_of_step")
+            
             # Determine what messages to return to the caller (typically just the AI's output from this turn)
             # `all_response_messages` are the Message objects generated by the AI in this step
             messages_to_return_openai_dict = [msg.to_openai_dict() for msg in all_response_messages] if return_dicts else all_response_messages
@@ -1051,6 +1303,77 @@ class Agent(object):
             else:
                 printd(f"step() failed with an unrecognized exception: '{str(e)}'")
                 raise e
+
+        finally:
+            # This block will always execute, even if an error occurs in the try block
+            # However, if we want to log embeddings only on successful completion of a step,
+            # this might not be the right place. The current placement is after most operations.
+            pass # Current end-of-step logging is handled before return
+
+    def _trigger_archival_embeddings_log(self, log_reason: str):
+        """Logs a snapshot of all current archival memory embeddings."""
+        # if not self.log_step_embeddings: # DEBUG: Temporarily bypass this check
+        #     return
+        self.log_step_embeddings = True # DEBUG: Force true for this method call
+
+        # Increment step_count only for the primary "end_of_step" log to count agent interactions
+        if log_reason == "end_of_step":
+            self.step_count += 1
+
+        try:
+            log_dir_path = None
+            if self.embeddings_log_dir:
+                log_dir_path = Path(self.embeddings_log_dir)
+            else:
+                if hasattr(self.persistence_manager, 'agent_dir') and self.persistence_manager.agent_dir:
+                    log_dir_path = self.persistence_manager.agent_dir / "step_embeddings_logs"
+                else:
+                    from memgpt.config import MemGPTConfig # Corrected import location
+                    default_logs_path = Path(MemGPTConfig.config_path()).parent / "embeddings_logs" / str(self.agent_state.id)
+                    log_dir_path = default_logs_path
+                    print(f"Warning: self.persistence_manager.agent_dir not found, using default log path: {log_dir_path}") # This is already print
+            
+            if log_dir_path:
+                # print(f"AGENT_LOG_DEBUG: Determined log_dir_path for '{log_reason}' embeddings: {log_dir_path.resolve()}")
+                # print(f"AGENT_LOG_DEBUG: Attempting to create directory (and parents) for '{log_reason}': {log_dir_path}")
+                try:
+                    log_dir_path.mkdir(parents=True, exist_ok=True)
+                    # print(f"AGENT_LOG_DEBUG: Directory check/creation complete for '{log_reason}': {log_dir_path}")
+                except Exception as e_mkdir:
+                    # print(f"AGENT_LOG_CRITICAL: Failed to create directory {log_dir_path} for '{log_reason}': {e_mkdir}") # Changed from CRITICAL DEBUG
+                    raise
+                
+                timestamp = get_utc_time().strftime("%Y%m%d_%H%M%S_%f")
+                # Use current self.step_count, reason, and timestamp for unique filename
+                filename = f"step_{self.step_count:05d}_{log_reason}_{timestamp}_embeddings.json"
+                filepath = log_dir_path / filename
+
+                passages_data = self.persistence_manager.archival_memory.storage.get_all()
+                embeddings_to_log = []
+                for passage in passages_data:
+                    embedding_list = None
+                    if hasattr(passage, 'embedding') and passage.embedding is not None:
+                        if hasattr(passage.embedding, 'tolist'):
+                            embedding_list = passage.embedding.tolist()
+                        elif isinstance(passage.embedding, list):
+                            embedding_list = passage.embedding 
+                    
+                    embeddings_to_log.append({
+                        "id": str(passage.id) if hasattr(passage, 'id') else None,
+                        "text_snippet": passage.text[:200] + ("..." if len(passage.text) > 200 else "") if hasattr(passage, 'text') else None,
+                        "embedding": embedding_list
+                    })
+                
+                with open(filepath, 'w') as f:
+                    json.dump(embeddings_to_log, f, indent=2)
+                print(f"AGENT_LOG_INFO: Logged {len(embeddings_to_log)} archival embeddings ({log_reason}) to {filepath}")
+            else:
+                print(f"AGENT_LOG_ERROR: Could not determine a valid directory for logging '{log_reason}' step embeddings.")
+
+        except Exception as e_log:
+            print(f"AGENT_LOG_ERROR: Error during '{log_reason}' step_embeddings logging: {e_log}")
+            import traceback
+            traceback.print_exc()
 
     def summarize_messages_inplace(self, cutoff=None, preserve_last_N_messages=True, disallow_tool_as_first=True):
         assert self.messages[0]["role"] == "system", f"self.messages[0] should be system (instead got {self.messages[0]})"
@@ -1197,31 +1520,6 @@ class Agent(object):
             )
         )
 
-    # def to_agent_state(self) -> AgentState:
-    #    # The state may have change since the last time we wrote it
-    #    updated_state = {
-    #        "persona": self.memory.persona,
-    #        "human": self.memory.human,
-    #        "system": self.system,
-    #        "functions": self.functions,
-    #        "messages": [str(msg.id) for msg in self._messages],
-    #    }
-
-    #    agent_state = AgentState(
-    #        name=self.agent_state.name,
-    #        user_id=self.agent_state.user_id,
-    #        persona=self.agent_state.persona,
-    #        human=self.agent_state.human,
-    #        llm_config=self.agent_state.llm_config,
-    #        embedding_config=self.agent_state.embedding_config,
-    #        preset=self.agent_state.preset,
-    #        id=self.agent_state.id,
-    #        created_at=self.agent_state.created_at,
-    #        state=updated_state,
-    #    )
-
-    #    return agent_state
-
     def add_function(self, function_name: str) -> str:
         if function_name in self.functions_python.keys():
             msg = f"Function {function_name} already loaded"
@@ -1263,24 +1561,6 @@ class Agent(object):
         self.update_state()
         printd(msg)
         return msg
-
-    # def save(self):
-    #    """Save agent state locally"""
-
-    #    new_agent_state = self.to_agent_state()
-
-    #    # without this, even after Agent.__init__, agent.config.state["messages"] will be None
-    #    self.agent_state = new_agent_state
-
-    #    # Check if we need to create the agent
-    #    if not self.ms.get_agent(agent_id=new_agent_state.id, user_id=new_agent_state.user_id, agent_name=new_agent_state.name):
-    #        # print(f"Agent.save {new_agent_state.id} :: agent does not exist, creating...")
-    #        self.ms.create_agent(agent=new_agent_state)
-    #    # Otherwise, we should update the agent
-    #    else:
-    #        # print(f"Agent.save {new_agent_state.id} :: agent already exists, updating...")
-    #        print(f"Agent.save {new_agent_state.id} :: preupdate:\n\tmessages={new_agent_state.state['messages']}")
-    #        self.ms.update_agent(agent=new_agent_state)
 
     def update_state(self) -> AgentState:
         updated_state = {
@@ -1411,56 +1691,6 @@ class Agent(object):
         except Exception as e:
             printd(f"Error calculating furthest embeddings: {e}")
             return []
-
-    def plot_centroids(self, save_path: Optional[str] = None):
-        """Plot the history of centroids using PCA for dimensionality reduction.
-        
-        Args:
-            save_path: Optional path to save the plot. If None, plot is displayed.
-        """
-        try:
-            import matplotlib.pyplot as plt
-            from sklearn.decomposition import PCA
-            import numpy as np
-            
-            if not self.centroid_history:
-                print("No centroids to plot")
-                return
-                
-            # Convert centroids to numpy array
-            centroids = np.array(self.centroid_history)
-            
-            # Reduce to 2D using PCA
-            pca = PCA(n_components=2)
-            centroids_2d = pca.fit_transform(centroids)
-            
-            # Create the plot
-            plt.figure(figsize=(10, 6))
-            
-            # Plot centroids
-            plt.scatter(centroids_2d[:, 0], centroids_2d[:, 1], c='blue', alpha=0.6)
-            
-            # Add timestamps as labels
-            for i, (x, y) in enumerate(centroids_2d):
-                plt.annotate(f"t{i+1}", (x, y), fontsize=8)
-            
-            # Connect centroids with lines to show progression
-            plt.plot(centroids_2d[:, 0], centroids_2d[:, 1], 'r--', alpha=0.3)
-            
-            plt.title("Centroid Evolution Over Time")
-            plt.xlabel("PCA Component 1")
-            plt.ylabel("PCA Component 2")
-            
-            if save_path:
-                plt.savefig(save_path)
-                print(f"Plot saved to {save_path}")
-            else:
-                plt.show()
-                
-        except ImportError as e:
-            print(f"Error: Required packages not found. Please install matplotlib and scikit-learn: {e}")
-        except Exception as e:
-            print(f"Error plotting centroids: {e}")
 
 
 def save_agent(agent: Agent, ms: MetadataStore):
