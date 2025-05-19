@@ -842,9 +842,27 @@ class Agent(object):
                     # Try step again
                     return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
                 elif self.mem_mode == "focus":
-                    print("=" * 50)
-                    print(" ||  CONTEXT OVERFLOW - FOCUS MODE ACTIVATED  ||")
-                    print("=" * 50)
+                    print("=" * 70)
+                    print("  ||  CONTEXT OVERFLOW - FOCUS MODE ACTIVATED - PRE-SUMMARY DIAGNOSTICS  ||")
+                    print("=" * 70)
+                    
+                    original_user_message_text = user_message.text if isinstance(user_message, Message) else str(user_message)
+                    print(f"Focus Pre-Summary: Original user_message causing overflow (text snippet): {original_user_message_text[:200]}...")
+                    print(f"Focus Pre-Summary: Current self._messages count: {len(self._messages)}")
+                    current_messages_tokens = 0
+                    for i, msg_obj in enumerate(self._messages):
+                        role = msg_obj.role
+                        content_snippet = msg_obj.text[:100] if msg_obj.text else "[No text content]"
+                        msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
+                        current_messages_tokens += msg_tokens
+                        print(f"  [{i}] Role: {role}, ID: {msg_obj.id}, Tokens: {msg_tokens}, Content: '{content_snippet}...'")
+                    print(f"Focus Pre-Summary: Total tokens in self._messages: {current_messages_tokens}")
+                    
+                    # Estimate tokens if current user_message was added
+                    user_message_tokens_for_diag = count_tokens(str(user_message.to_openai_dict() if isinstance(user_message, Message) else {"role": "user", "content": str(user_message)}))
+                    print(f"Focus Pre-Summary: Tokens in current user_message: {user_message_tokens_for_diag}")
+                    print(f"Focus Pre-Summary: Estimated total tokens IF user_message was appended (before summary): {current_messages_tokens + user_message_tokens_for_diag}")
+                    
                     print(f"Context overflow in 'focus' mode. Attempting to generate message pair embeddings.")
                     try:
                         message_pair_embeddings_with_ids = create_message_pair_embeddings(
@@ -855,7 +873,6 @@ class Agent(object):
 
                         if not message_pair_embeddings_with_ids:
                             print("No message pair embeddings generated. Defaulting to FIFO summarization or error.")
-                            # Decide: either call FIFO or re-raise. For now, re-raise as focus logic is incomplete.
                             raise e 
 
                         # Extract just the embedding vectors for centroid and distance calculation
@@ -867,21 +884,17 @@ class Agent(object):
 
                         if centroid_vec is None:
                             print("Centroid calculation failed (no vectors or other issue). Defaulting to FIFO or error.")
-                            raise e # Re-raise, focus logic incomplete
+                            raise e
                         
                         # Convert list of list to list of np.array for distance calculation
-                        # Assuming calculate_cosine_distances expects list of np.array if not already handled inside
-                        # (current calculate_cosine_distances takes List[np.ndarray], so this conversion is good)
                         np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
                         distances = calculate_cosine_distances(centroid_vec, np_embedding_vectors)
                         
                         # Combine message IDs with their distances
-                        # Each element: (user_msg_id, assistant_msg_id, distance)
                         messages_with_distances = []
                         for i, pair_data in enumerate(message_pair_embeddings_with_ids):
                             user_msg_id = pair_data[0]
                             assistant_msg_id = pair_data[1]
-                            # pair_data[2] is the embedding itself, distances[i] is the calculated distance
                             messages_with_distances.append({
                                 "user_msg_id": user_msg_id,
                                 "assistant_msg_id": assistant_msg_id,
@@ -898,6 +911,29 @@ class Agent(object):
                         # Implement summarization based on these sorted messages.
                         try:
                             self.summarize_messages_focus_inplace(sorted_messages_by_distance)
+                            
+                            print("-" * 70)
+                            print("  ||  FOCUS MODE - POST-SUMMARY DIAGNOSTICS (BEFORE RETRY)  ||")
+                            print("-" * 70)
+                            
+                            user_message_for_retry_text = user_message.text if isinstance(user_message, Message) else str(user_message)
+                            print(f"Focus Post-Summary: User_message for retry (text snippet): {user_message_for_retry_text[:200]}...")
+                            print(f"Focus Post-Summary: New self._messages count: {len(self._messages)}")
+                            new_messages_tokens = 0
+                            for i, msg_obj in enumerate(self._messages):
+                                role = msg_obj.role
+                                content_snippet = msg_obj.text[:100] if msg_obj.text else "[No text content]"
+                                msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
+                                new_messages_tokens += msg_tokens
+                                print(f"  [{i}] Role: {role}, ID: {msg_obj.id}, Tokens: {msg_tokens}, Content: '{content_snippet}...'")
+                            print(f"Focus Post-Summary: Total tokens in new self._messages: {new_messages_tokens}")
+                            
+                            user_message_tokens_for_retry_diag = count_tokens(str(user_message.to_openai_dict() if isinstance(user_message, Message) else {"role": "user", "content": str(user_message)}))
+                            print(f"Focus Post-Summary: Tokens in user_message for retry: {user_message_tokens_for_retry_diag}")
+                            estimated_tokens_for_retry_api_call = new_messages_tokens + user_message_tokens_for_retry_diag
+                            print(f"Focus Post-Summary: Estimated total tokens for API call in retry: {estimated_tokens_for_retry_api_call}")
+                            print(f"Focus Post-Summary: LLM context window: {self.agent_state.llm_config.context_window}")
+                            
                             # Try step again
                             print("Focus mode: Summarization complete, retrying step.")
                             return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
@@ -1096,7 +1132,7 @@ class Agent(object):
                 print(f"Focus summarize: Skipping pair (User: {user_msg_id}, Asst: {assistant_msg_id}) as it's in preserve list.")
                 continue
             
-            # Skip if already marked for removal (e.g. if a message could somehow be part of two pairs - not current logic)
+            # Skip if already marked for removal
             if user_msg_id in message_ids_to_remove_set or assistant_msg_id in message_ids_to_remove_set:
                 continue
 
@@ -1107,7 +1143,7 @@ class Agent(object):
                 print(f"{CLI_WARNING_PREFIX}Focus summarize: Could not find message objects for pair (User: {user_msg_id}, Asst: {assistant_msg_id}). Skipping.")
                 continue
             
-            # Check if these are system messages (should not happen with current pair creation logic)
+            # Skip if either message is a system message
             if user_msg_obj.role == "system" or assistant_msg_obj.role == "system":
                 print(f"{CLI_WARNING_PREFIX}Focus summarize: Attempted to select a system message in pair ({user_msg_id}, {assistant_msg_id}). Skipping.")
                 continue
