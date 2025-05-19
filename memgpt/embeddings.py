@@ -3,6 +3,7 @@ import uuid
 from typing import Optional, List, Any, Tuple
 import os
 import numpy as np
+import json
 
 from memgpt.utils import is_valid_url, printd
 from memgpt.data_types import EmbeddingConfig, Message
@@ -276,32 +277,40 @@ def create_message_pair_embeddings(
         msg2 = message_sequence[i+1]
 
         if msg1.role == "user" and msg2.role == "assistant":
-            # Ensure text is not None and IDs are not None
-            text1 = msg1.text if msg1.text is not None else ""
-            text2 = msg2.text if msg2.text is not None else ""
-            
-            if msg1.id is None or msg2.id is None:
-                print(f"Warning: Skipping message pair due to missing ID(s). User msg ID: {msg1.id}, Assistant msg ID: {msg2.id}")
-                continue
-
-            combined_text = text1.strip() + " " + text2.strip() # Simple concatenation with a space
-
-            # Skip embedding if combined text is empty or only whitespace
-            if not combined_text.strip():
-                continue
-
             try:
-                # This relies on 'create_embedding' being defined and accessible in this file's scope
-                embedding_vector = create_embedding(
-                    text=combined_text,
-                    embedding_config=embedding_config,
-                    # The 'create_embedding' function should handle which specific model to use
-                    # based on embedding_config or its own logic.
-                )
-                pair_embeddings.append((msg1.id, msg2.id, embedding_vector))
-            except Exception as e:
-                print(f"Error creating embedding for pair (user_msg_id={msg1.id}, assistant_msg_id={msg2.id}): {e}")
-                # Optionally skip this pair or append a placeholder
+                # Parse the JSON content to check the 'type' field
+                msg1_content = json.loads(msg1.text)
+                if msg1_content.get('type') == 'user_message':
+                    # This is a regular user message, proceed with embedding
+                    # Ensure text is not None and IDs are not None
+                    text1 = msg1.text if msg1.text is not None else ""
+                    text2 = msg2.text if msg2.text is not None else ""
+                    
+                    if msg1.id is None or msg2.id is None:
+                        print(f"Warning: Skipping message pair due to missing ID(s). User msg ID: {msg1.id}, Assistant msg ID: {msg2.id}")
+                        continue
+
+                    combined_text = text1.strip() + " " + text2.strip() # Simple concatenation with a space
+
+                    # Skip embedding if combined text is empty or only whitespace
+                    if not combined_text.strip():
+                        continue
+
+                    try:
+                        # This relies on 'create_embedding' being defined and accessible in this file's scope
+                        embedding_vector = create_embedding(
+                            text=combined_text,
+                            embedding_config=embedding_config,
+                            # The 'create_embedding' function should handle which specific model to use
+                            # based on embedding_config or its own logic.
+                        )
+                        pair_embeddings.append((msg1.id, msg2.id, embedding_vector))
+                    except Exception as e:
+                        print(f"Error creating embedding for pair (user_msg_id={msg1.id}, assistant_msg_id={msg2.id}): {e}")
+                        # Optionally skip this pair or append a placeholder
+                        continue
+            except json.JSONDecodeError:
+                # If JSON parsing fails, skip this pair
                 continue
 
     return pair_embeddings
