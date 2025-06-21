@@ -8,6 +8,7 @@ configs/
 # for data
 *.json
 *.jsonl
+*.jsonl.*
 ### Eclipse ###
 .metadata
 bin/
