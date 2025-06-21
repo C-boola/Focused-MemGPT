@@ -1,13 +1,15 @@
 import typer
 import uuid
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Tuple
 import os
 import numpy as np
+import json
 
 from memgpt.utils import is_valid_url, printd
-from memgpt.data_types import EmbeddingConfig
+from memgpt.data_types import EmbeddingConfig, Message
 from memgpt.credentials import MemGPTCredentials
-from memgpt.constants import MAX_EMBEDDING_DIM, EMBEDDING_TO_TOKENIZER_MAP, EMBEDDING_TO_TOKENIZER_DEFAULT
+from memgpt.constants import MAX_EMBEDDING_DIM, EMBEDDING_TO_TOKENIZER_MAP, EMBEDDING_TO_TOKENIZER_DEFAULT, DEFAULT_EMBEDDING_MODEL
+from memgpt.config import MemGPTConfig
 
 # from llama_index.core.base.embeddings import BaseEmbedding
 from llama_index.core.node_parser import SentenceSplitter
@@ -199,3 +201,180 @@ def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None
 
     else:
         return default_embedding_model()
+
+
+def create_embedding(text: str, embedding_config: EmbeddingConfig, model: Optional[str] = None) -> List[float]:
+    """
+    Generates an embedding for the given text using the specified configuration.
+    This function acts as a wrapper around the LlamaIndex embedding model logic.
+    """
+    # Initialize the embedding model using the agent's config
+    # The 'model' parameter here is for potentially overriding the model from embedding_config if needed,
+    # but embedding_model function primarily uses embedding_config.
+    
+    # Extract user_id from embedding_config if available and relevant for the model
+    # user_id_to_pass = None # Placeholder, adjust if user_id needs to be sourced differently or passed through
+    # For instance, if embedding_config could carry a user_id or if it's globally available
+    
+    embed_model = embedding_model(config=embedding_config) # user_id can be passed if available in config/context
+
+    # Check if the text needs to be split due to length constraints
+    # The specific model name might be in embedding_config.embedding_model
+    texts_to_embed = check_and_split_text(text, embedding_config.embedding_model if embedding_config else DEFAULT_EMBEDDING_MODEL)
+    
+    # For simplicity, if splitting occurs, we might average embeddings or handle appropriately.
+    # Here, assuming check_and_split_text returns a list and we use the first part,
+    # or that it handles overly long text by truncation/error.
+    # A more robust implementation might embed chunks and average them.
+    if not texts_to_embed:
+        raise ValueError("Text resulted in no content after splitting/checking.")
+
+    # LlamaIndex's BaseEmbedding models usually have a get_text_embedding or similar method.
+    # If it's a list of texts (e.g. from chunking), it might be get_text_embedding_batch.
+    # We'll assume get_text_embedding for a single string for now.
+    embedding_vector = embed_model.get_text_embedding(texts_to_embed[0])
+    
+    # Ensure the embedding is a list of floats and pad if necessary (though padding is often context-specific)
+    if not isinstance(embedding_vector, list) or not all(isinstance(x, float) for x in embedding_vector):
+        # Try to convert if it's a numpy array, common for some embedding libraries
+        if hasattr(embedding_vector, 'tolist'):
+            embedding_vector = embedding_vector.tolist()
+        else:
+            raise TypeError(f"Embedding generation did not return a list of floats. Got: {type(embedding_vector)}")
+
+    # Padding to MAX_EMBEDDING_DIM is usually for storage in a DB with fixed vector sizes.
+    # If create_embedding is for general use, this might be optional or handled by the caller.
+    # query_embedding function already handles padding.
+    # For now, returning raw embedding from the model.
+    return embedding_vector
+
+
+def create_message_pair_embeddings(
+    message_sequence: List[Message],
+    embedding_config: EmbeddingConfig,
+) -> List[Tuple[uuid.UUID, uuid.UUID, List[float]]]:
+    """
+    Creates vector embeddings for message pairs (user message and subsequent assistant message).
+
+    Args:
+        message_sequence: A list of Message objects.
+        embedding_config: The embedding configuration for the agent.
+
+    Returns:
+        A list of tuples, where each tuple contains:
+        (user_message_id, assistant_message_id, combined_embedding_vector).
+    """
+    pair_embeddings = []
+    if not message_sequence or len(message_sequence) < 2:
+        return pair_embeddings
+
+    # Find the create_embedding function, it might be local or needs to be dynamically accessed
+    # For this edit, we assume create_embedding is available in the scope.
+    # If create_embedding is a global function in this file, this direct call is fine.
+
+    for i in range(len(message_sequence) - 1):
+        msg1 = message_sequence[i]
+        msg2 = message_sequence[i+1]
+
+        if msg1.role == "user" and msg2.role == "assistant":
+            try:
+                # Parse the JSON content to check the 'type' field
+                msg1_content = json.loads(msg1.text)
+                if msg1_content.get('type') == 'user_message':
+                    # This is a regular user message, proceed with embedding
+                    # Ensure text is not None and IDs are not None
+                    text1 = msg1.text if msg1.text is not None else ""
+                    text2 = msg2.text if msg2.text is not None else ""
+                    
+                    if msg1.id is None or msg2.id is None:
+                        print(f"Warning: Skipping message pair due to missing ID(s). User msg ID: {msg1.id}, Assistant msg ID: {msg2.id}")
+                        continue
+
+                    combined_text = text1.strip() + " " + text2.strip() # Simple concatenation with a space
+
+                    # Skip embedding if combined text is empty or only whitespace
+                    if not combined_text.strip():
+                        continue
+
+                    try:
+                        # This relies on 'create_embedding' being defined and accessible in this file's scope
+                        embedding_vector = create_embedding(
+                            text=combined_text,
+                            embedding_config=embedding_config,
+                            # The 'create_embedding' function should handle which specific model to use
+                            # based on embedding_config or its own logic.
+                        )
+                        pair_embeddings.append((msg1.id, msg2.id, embedding_vector))
+                    except Exception as e:
+                        print(f"Error creating embedding for pair (user_msg_id={msg1.id}, assistant_msg_id={msg2.id}): {e}")
+                        # Optionally skip this pair or append a placeholder
+                        continue
+            except json.JSONDecodeError:
+                # If JSON parsing fails, skip this pair
+                continue
+
+    return pair_embeddings
+
+
+def calculate_centroid(embedding_vectors: List[List[float]]) -> Optional[np.ndarray]:
+    """
+    Calculates the centroid (mean vector) of a list of embedding vectors.
+
+    Args:
+        embedding_vectors: A list of embedding vectors (list of lists of floats).
+
+    Returns:
+        A numpy array representing the centroid, or None if the input is empty.
+    """
+    if not embedding_vectors:
+        return None
+    
+    # Convert list of lists to a 2D numpy array
+    vectors_array = np.array(embedding_vectors)
+    
+    # Calculate the mean across the 0-th axis (column-wise mean for each dimension)
+    centroid = np.mean(vectors_array, axis=0)
+    return centroid
+
+
+def calculate_cosine_distances(target_vector: np.ndarray, embedding_vectors: List[np.ndarray]) -> List[float]:
+    """
+    Calculates the cosine distance of each vector in a list from a target vector.
+
+    Args:
+        target_vector: The vector from which distances are measured (e.g., a centroid).
+        embedding_vectors: A list of numpy arrays (embedding vectors).
+
+    Returns:
+        A list of cosine distances.
+    """
+    distances = []
+    if target_vector is None or not embedding_vectors:
+        return distances
+
+    # Normalize the target vector
+    norm_target = np.linalg.norm(target_vector)
+    if norm_target == 0: # Avoid division by zero for a zero vector
+        # If target is zero vector, distance is undefined or 1 (if vectors are non-zero)
+        # or 0 (if vector is also zero). Let's assume 1 for non-zero vectors.
+        # For simplicity, if centroid is zero, all distances are effectively max (or handle as error)
+        return [1.0] * len(embedding_vectors) 
+    
+    normalized_target_vector = target_vector / norm_target
+
+    for vec in embedding_vectors:
+        norm_vec = np.linalg.norm(vec)
+        if norm_vec == 0: # Avoid division by zero for a zero vector
+            distances.append(1.0) # Distance to a zero vector is 1 (max)
+            continue
+        
+        normalized_vec = vec / norm_vec
+        
+        # Cosine similarity
+        similarity = np.dot(normalized_target_vector, normalized_vec)
+        
+        # Cosine distance
+        distance = 1 - similarity
+        distances.append(distance)
+        
+    return distances
