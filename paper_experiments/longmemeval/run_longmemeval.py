@@ -330,9 +330,6 @@ def create_custom_message_pair_embeddings(message_sequence, embedding_config):
                         embedding_config=embedding_config,
                     )
                     pair_embeddings.append((msg1.id, msg2.id, embedding_vector))
-                    
-                    if len(pair_embeddings) <= 3:  # Log first few for debugging
-                        log_debug(f"Created embedding {len(pair_embeddings)}: User='{text1[:50]}...', Assistant='{text2[:50]}...'")
                         
                 except Exception as e:
                     log_debug(f"Error creating embedding for pair (user_msg_id={msg1.id}, assistant_msg_id={msg2.id}): {e}")
@@ -349,10 +346,28 @@ def main():
     """Main execution function to run the benchmark with resume and interrupt support."""
     print("===== MemGPT LongMemEval Benchmark Script =====")
     
-    # Check for test mode
-    test_mode = len(sys.argv) > 1 and sys.argv[1] == "--test"
+    # --- Argument Parsing ---
+    args = sys.argv[1:]
+    test_mode = "--test" in args
+    
+    memory_mode = "focus"  # Default mode
+    if "--mode" in args:
+        try:
+            mode_index = args.index("--mode") + 1
+            if mode_index < len(args):
+                specified_mode = args[mode_index]
+                if specified_mode in ["focus", "fifo"]:
+                    memory_mode = specified_mode
+                else:
+                    print(f"Warning: Invalid memory mode '{specified_mode}'. Defaulting to 'focus'.")
+            else:
+                print("Warning: --mode flag used without a value. Defaulting to 'focus'.")
+        except (ValueError, IndexError):
+            print("Error parsing --mode flag. Defaulting to 'focus'.")
+
     if test_mode:
         print("RUNNING IN TEST MODE - Will process only first 3 cases with verbose output")
+    print(f"Using memory mode: {memory_mode.upper()}")
     
     # Load the base config once to pass to each agent instance
     config = MemGPTConfig.load()
@@ -404,7 +419,7 @@ def main():
                     print(f"TOTAL TURNS: {total_turns}")
                     print(f"{'='*50}")
                 
-                hypothesis = run_test_instance(config, case)
+                hypothesis = run_test_instance(config, case, memory_mode=memory_mode)
                 
                 result = {
                     "question_id": case['question_id'],

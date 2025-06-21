@@ -2,6 +2,26 @@
 
 This benchmark is designed to test MemGPT's long-term memory and context management capabilities using the LongMemEval dataset. It uses a custom script (`run_longmemeval.py`) that directly controls a MemGPT agent to ensure that memory management functions like context overflow, summarization, and embedding generation are explicitly triggered and tested.
 
+## Setup: Downloading the Data
+
+Before running the benchmark, you must download the required dataset files and place them in the `data/` directory.
+
+1.  Navigate to the data directory from the root of this experiment:
+    ```bash
+    cd ./data
+    ```
+
+2.  Download the main data file (`longmemeval_s.json`) and the oracle file (`longmemeval_oracle.json`) from the Hugging Face Hub.
+    ```bash
+    wget https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_s.json
+    wget https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_oracle.json
+    ```
+
+3.  Once the downloads are complete, return to the experiment's root directory:
+    ```bash
+    cd ..
+    ```
+
 ## How It Works
 
 This benchmark script is a powerful tool for testing MemGPT's core memory features because it bypasses the standard client-server model and directly instantiates and controls the `Agent` class. This allows for a more controlled and observable experimental setup.
@@ -28,21 +48,33 @@ cd /path/to/Focused-MemGPT/paper_experiments/longmemeval
 
 ### Step 2: Run the Benchmark
 
-There are two modes to run the benchmark:
+You can run the benchmark script with several command-line options to control its behavior.
 
-**A) Full Run (Recommended for final results)**
-This will process all ~289 test cases and will take a significant amount of time and LLM credits.
+**Choosing a Memory Mode (`--mode`)**
 
-```bash
-python run_longmemeval.py
-```
+The `--mode` flag allows you to specify which memory management strategy to use. If omitted, it defaults to `focus`.
 
-**B) Test Mode (Recommended for debugging)**
-This will run only the first 3 test cases with verbose debug output, allowing you to quickly verify that everything is working.
+*   **Run with FIFO mode:**
+    ```bash
+    python run_longmemeval.py --mode fifo
+    ```
+*   **Run with Focus mode:**
+    ```bash
+    python run_longmemeval.py --mode focus
+    ```
 
-```bash
-python run_longmemeval.py --test
-```
+**Using Test Mode (`--test`)**
+
+The `--test` flag runs only the first 3 test cases with verbose debug output, which is highly recommended for debugging and quick verification.
+
+*   **Run a quick test using FIFO mode:**
+    ```bash
+    python run_longmemeval.py --test --mode fifo
+    ```
+*   **Run a quick test using the default Focus mode:**
+    ```bash
+    python run_longmemeval.py --test
+    ```
 
 ### Step 3: Generated Output
 
