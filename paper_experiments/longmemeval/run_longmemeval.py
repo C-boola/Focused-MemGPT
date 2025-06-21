@@ -23,17 +23,35 @@ from memgpt.interface import AgentInterface
 from memgpt.data_types import AgentState
 from memgpt.presets.presets import available_presets
 from memgpt.config import MemGPTConfig
-from memgpt.constants import DEFAULT_PRESET, DEFAULT_PERSONA, DEFAULT_HUMAN
-from memgpt.utils import get_persona_text, get_human_text
+from memgpt.constants import DEFAULT_PRESET, DEFAULT_PERSONA, DEFAULT_HUMAN, MESSAGE_SUMMARY_WARNING_FRAC
+from memgpt.utils import get_persona_text, get_human_text, count_tokens
 from memgpt.prompts import gpt_system
 from memgpt.presets.presets import generate_functions_json
 
 # A dummy interface to suppress the agent's internal terminal output during the run
 class SilentInterface(AgentInterface):
-    def user_message(self, msg, msg_obj=None) -> None: pass
-    def internal_monologue(self, msg, msg_obj=None) -> None: pass
-    def assistant_message(self, msg, msg_obj=None) -> None: pass
-    def function_message(self, msg, msg_obj=None) -> None: pass
+    def user_message(self, msg, msg_obj=None) -> None: 
+        # Show user messages if they contain memory warnings or heartbeats
+        if msg and ("memory" in msg.lower() or "heartbeat" in msg.lower() or "summary" in msg.lower()):
+            print(f"[MEMORY] User: {msg}")
+    
+    def internal_monologue(self, msg, msg_obj=None) -> None: 
+        # Show internal thoughts related to memory operations
+        if msg and any(keyword in msg.lower() for keyword in ["memory", "summary", "context", "overflow", "embedding"]):
+            print(f"[MEMORY] Internal: {msg}")
+    
+    def assistant_message(self, msg, msg_obj=None) -> None: 
+        # Show assistant messages related to memory operations
+        if msg and any(keyword in msg.lower() for keyword in ["memory", "summary", "context", "overflow"]):
+            print(f"[MEMORY] Assistant: {msg}")
+    
+    def function_message(self, msg, msg_obj=None) -> None: 
+        # Show all function calls related to memory
+        if msg and any(keyword in msg.lower() for keyword in ["memory", "summary", "archival", "core_memory", "recall"]):
+            print(f"[MEMORY] Function: {msg}")
+        # Also show any running/success messages for memory functions
+        elif msg and ("running" in msg.lower() or "success" in msg.lower()) and any(keyword in msg.lower() for keyword in ["memory", "archival", "core"]):
+            print(f"[MEMORY] Function: {msg}")
 
 # --- Constants ---
 MODULE_BASE_PATH = os.path.dirname(__file__)
@@ -103,12 +121,13 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
             "system": gpt_system.get_system_text(preset_system_prompt),
             "functions": functions_schema,
             "messages": None,
+            "mem_mode": memory_mode,  # Explicitly set memory mode
         },
     )
 
     try:
-        agent = Agent(interface=SilentInterface(), agent_state=agent_state)
-        log_debug(f"Successfully created agent '{agent.agent_state.name}' in-memory.")
+        agent = Agent(interface=SilentInterface(), agent_state=agent_state, mem_mode=memory_mode)
+        log_debug(f"Successfully created agent '{agent.agent_state.name}' with memory mode: {memory_mode}")
     except Exception as e:
         log_debug(f"FATAL ERROR in instance {q_id}: Could not instantiate Agent object. Error: {e}")
         traceback.print_exc()
@@ -121,6 +140,107 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
     # Use the agent's internal, direct append method
     agent.append_to_messages(full_chat_history)
     log_debug(f"Injection complete. Agent now has {len(agent.messages)} messages in its history.")
+
+    # 2.5. EXPLICIT CONTEXT OVERFLOW CHECK AND FORCE SUMMARIZATION
+    log_debug("Checking if injected history exceeds context limits...")
+    
+    # Calculate current token count
+    current_tokens = sum(count_tokens(str(msg)) for msg in agent.messages)
+    context_window = agent.agent_state.llm_config.context_window
+    overflow_threshold = MESSAGE_SUMMARY_WARNING_FRAC * context_window
+    
+    log_debug(f"Current tokens: {current_tokens}, Context window: {context_window}, Overflow threshold: {overflow_threshold}")
+    
+    if current_tokens > overflow_threshold:
+        log_debug(f"CONTEXT OVERFLOW DETECTED! Current tokens ({current_tokens}) > threshold ({overflow_threshold})")
+        log_debug(f"Forcing {memory_mode} mode summarization...")
+        
+        try:
+            if memory_mode == "focus":
+                # Force focus mode summarization
+                print("=" * 70)
+                print("  ||  MANUAL FOCUS MODE SUMMARIZATION TRIGGERED  ||")
+                print("=" * 70)
+                
+                from memgpt.embeddings import calculate_centroid, calculate_cosine_distances
+                import numpy as np
+                
+                # Generate embeddings for focus mode using our custom function
+                message_pair_embeddings_with_ids = create_custom_message_pair_embeddings(
+                    message_sequence=agent._messages, 
+                    embedding_config=agent.agent_state.embedding_config
+                )
+                log_debug(f"Generated {len(message_pair_embeddings_with_ids)} message pair embeddings.")
+                
+                # DEBUG: Let's see what the message structure looks like
+                if len(message_pair_embeddings_with_ids) == 0:
+                    log_debug("DEBUG: No embeddings generated. Analyzing message structure...")
+                    log_debug(f"Total messages in agent: {len(agent._messages)}")
+                    
+                    # Check first few messages to understand structure
+                    for i, msg in enumerate(agent._messages[:10]):
+                        log_debug(f"Message {i}: role='{msg.role}', text_snippet='{str(msg.text)[:100] if msg.text else 'None'}...'")
+                    
+                    # Check for user-assistant pairs manually
+                    user_assistant_pairs = 0
+                    for i in range(len(agent._messages) - 1):
+                        msg1 = agent._messages[i]
+                        msg2 = agent._messages[i+1]
+                        if msg1.role == "user" and msg2.role == "assistant":
+                            user_assistant_pairs += 1
+                            if user_assistant_pairs <= 3:  # Show first 3 pairs
+                                log_debug(f"Found pair {user_assistant_pairs}: User='{str(msg1.text)[:50]}...', Assistant='{str(msg2.text)[:50]}...'")
+                    
+                    log_debug(f"Found {user_assistant_pairs} user-assistant pairs manually")
+                
+                if message_pair_embeddings_with_ids:
+                    # Calculate centroid and distances
+                    actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
+                    centroid_vec = calculate_centroid(actual_embedding_vectors)
+                    
+                    if centroid_vec is not None:
+                        np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
+                        distances = calculate_cosine_distances(centroid_vec, np_embedding_vectors)
+                        
+                        # Create sorted messages by distance
+                        messages_with_distances = []
+                        for i, pair_data in enumerate(message_pair_embeddings_with_ids):
+                            messages_with_distances.append({
+                                "user_msg_id": pair_data[0],
+                                "assistant_msg_id": pair_data[1],
+                                "distance": distances[i]
+                            })
+                        
+                        sorted_messages_by_distance = sorted(messages_with_distances, key=lambda x: x["distance"], reverse=True)
+                        log_debug(f"Sorted {len(sorted_messages_by_distance)} message pairs by distance.")
+                        
+                        # Trigger focus summarization
+                        agent.summarize_messages_focus_inplace(sorted_messages_by_distance)
+                        log_debug("Focus mode summarization completed successfully.")
+                    else:
+                        log_debug("Centroid calculation failed, falling back to FIFO.")
+                        agent.summarize_messages_inplace()
+                else:
+                    log_debug("No embeddings generated, falling back to FIFO.")
+                    agent.summarize_messages_inplace()
+                    
+            else:  # FIFO mode
+                print("=" * 70)
+                print("  ||  MANUAL FIFO MODE SUMMARIZATION TRIGGERED  ||")
+                print("=" * 70)
+                agent.summarize_messages_inplace()
+                log_debug("FIFO mode summarization completed successfully.")
+                
+            # Check tokens after summarization
+            new_tokens = sum(count_tokens(str(msg)) for msg in agent.messages)
+            log_debug(f"After summarization: {len(agent.messages)} messages, {new_tokens} tokens (reduced by {current_tokens - new_tokens})")
+            
+        except Exception as sum_e:
+            log_debug(f"ERROR during manual summarization: {sum_e}")
+            traceback.print_exc()
+            return f"ERROR: MANUAL_SUMMARIZATION_FAILED: {sum_e}"
+    else:
+        log_debug("No context overflow detected. Proceeding without summarization.")
 
     # 3. Trigger Reasoning with the Final Question
     final_question = test_case['question']
@@ -158,17 +278,95 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
     # Agent object is now out of scope and will be garbage collected. No manual deletion needed.
     return hypothesis
 
+def create_custom_message_pair_embeddings(message_sequence, embedding_config):
+    """
+    Custom embedding function for plain text messages (not JSON).
+    Creates vector embeddings for message pairs (user message and subsequent assistant message).
+    """
+    from memgpt.embeddings import create_embedding
+    import uuid
+    
+    pair_embeddings = []
+    if not message_sequence or len(message_sequence) < 2:
+        return pair_embeddings
+
+    log_debug(f"Creating custom embeddings for {len(message_sequence)} messages...")
+    
+    for i in range(len(message_sequence) - 1):
+        msg1 = message_sequence[i]
+        msg2 = message_sequence[i+1]
+
+        # Look for user-assistant pairs with plain text
+        if msg1.role == "user" and msg2.role == "assistant":
+            try:
+                # Get text content directly (no JSON parsing needed)
+                text1 = msg1.text if msg1.text is not None else ""
+                text2 = msg2.text if msg2.text is not None else ""
+                
+                # Skip empty messages or system-like messages
+                if not text1.strip() or not text2.strip():
+                    continue
+                
+                # Skip login messages and other system messages
+                if any(keyword in text1.lower() for keyword in ['login', 'bootup', 'system']):
+                    continue
+                
+                # Ensure IDs are not None
+                if msg1.id is None or msg2.id is None:
+                    log_debug(f"Warning: Skipping message pair due to missing ID(s). User msg ID: {msg1.id}, Assistant msg ID: {msg2.id}")
+                    continue
+
+                # Combine the messages
+                combined_text = text1.strip() + " " + text2.strip()
+
+                # Skip if combined text is too short
+                if len(combined_text.strip()) < 20:
+                    continue
+
+                try:
+                    # Create embedding for the combined text
+                    embedding_vector = create_embedding(
+                        text=combined_text,
+                        embedding_config=embedding_config,
+                    )
+                    pair_embeddings.append((msg1.id, msg2.id, embedding_vector))
+                    
+                    if len(pair_embeddings) <= 3:  # Log first few for debugging
+                        log_debug(f"Created embedding {len(pair_embeddings)}: User='{text1[:50]}...', Assistant='{text2[:50]}...'")
+                        
+                except Exception as e:
+                    log_debug(f"Error creating embedding for pair (user_msg_id={msg1.id}, assistant_msg_id={msg2.id}): {e}")
+                    continue
+                    
+            except Exception as e:
+                log_debug(f"Error processing message pair at index {i}: {e}")
+                continue
+
+    log_debug(f"Successfully created {len(pair_embeddings)} message pair embeddings")
+    return pair_embeddings
+
 def main():
     """Main execution function to run the benchmark with resume and interrupt support."""
     print("===== MemGPT LongMemEval Benchmark Script =====")
+    
+    # Check for test mode
+    test_mode = len(sys.argv) > 1 and sys.argv[1] == "--test"
+    if test_mode:
+        print("RUNNING IN TEST MODE - Will process only first 3 cases with verbose output")
+    
     # Load the base config once to pass to each agent instance
     config = MemGPTConfig.load()
     
     test_cases = load_and_filter_data()
     
+    # In test mode, only run first 3 cases
+    if test_mode:
+        test_cases = test_cases[:3]
+        print(f"Test mode: Limited to {len(test_cases)} cases")
+    
     # --- RESUME LOGIC ---
     completed_question_ids = set()
-    if os.path.exists(OUTPUT_PATH):
+    if os.path.exists(OUTPUT_PATH) and not test_mode:
         log_debug(f"Previous run detected. Checking existing results in: {OUTPUT_PATH}")
         try:
             with open(OUTPUT_PATH, 'r', encoding='utf-8') as f:
@@ -185,15 +383,27 @@ def main():
 
     remaining_test_cases = [case for case in test_cases if case['question_id'] not in completed_question_ids]
     
-    if completed_question_ids:
+    if completed_question_ids and not test_mode:
         print(f"\nFound {len(completed_question_ids)} completed instances. Resuming with {len(remaining_test_cases)} remaining test cases.")
     else:
-        print(f"\nStarting a fresh benchmark run on {len(test_cases)} filtered test cases.")
+        print(f"\nStarting {'test' if test_mode else 'benchmark'} run on {len(remaining_test_cases)} {'test' if test_mode else 'filtered'} cases.")
+    
+    # Use different output file for test mode
+    output_path = OUTPUT_PATH + ".test" if test_mode else OUTPUT_PATH
     
     # --- GRACEFUL INTERRUPT & APPEND LOGIC ---
-    with open(OUTPUT_PATH, 'a', encoding='utf-8') as outfile:
+    with open(output_path, 'w' if test_mode else 'a', encoding='utf-8') as outfile:
         try:
             for case in tqdm(remaining_test_cases, desc="Overall Progress"):
+                if test_mode:
+                    print(f"\n{'='*50}")
+                    print(f"TEST CASE: {case['question_id']}")
+                    print(f"QUESTION: {case['question']}")
+                    print(f"SESSIONS: {len(case['haystack_sessions'])}")
+                    total_turns = sum(len(session) for session in case['haystack_sessions'])
+                    print(f"TOTAL TURNS: {total_turns}")
+                    print(f"{'='*50}")
+                
                 hypothesis = run_test_instance(config, case)
                 
                 result = {
@@ -204,12 +414,16 @@ def main():
                 outfile.write(json.dumps(result) + '\n')
                 outfile.flush()
                 
+                if test_mode:
+                    print(f"RESULT: {hypothesis}")
+                    print(f"GROUND TRUTH: {result['ground_truth']}")
+                
         except KeyboardInterrupt:
             print("\n\nBenchmark interrupted by user (Ctrl+C). Progress has been saved.")
             print("To resume, simply run the script again.")
             
-    print(f"\n===== BENCHMARK RUN COMPLETE =====")
-    print(f"All hypotheses have been generated and saved to:\n{OUTPUT_PATH}")
+    print(f"\n===== {'TEST' if test_mode else 'BENCHMARK'} RUN COMPLETE =====")
+    print(f"All hypotheses have been generated and saved to:\n{output_path}")
 
 if __name__ == "__main__":
     main()
