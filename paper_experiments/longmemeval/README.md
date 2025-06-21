@@ -82,23 +82,34 @@ The script will generate a file named `memgpt_hypotheses.jsonl`. Each line in th
 
 ## How to Evaluate the Results
 
-After the benchmark run is complete, you can use the provided evaluation scripts to score the agent's performance against the ground truth ("oracle") answers.
+After the benchmark run is complete, you can use the provided evaluation scripts to score the agent's performance. This is a two-step process.
 
-### Step 1: Run the QA Evaluation Script
+### Step 1: Judge the Agent's Answers (`evaluate_qa.py`)
 
-This script compares the generated `memgpt_hypotheses.jsonl` with the `data/longmemeval_oracle.json` file and produces a `results.json` file with detailed scores.
+This script uses a powerful "judge" model (e.g., `gpt-4o-mini`) to compare the agent's generated answers (`memgpt_hypotheses.jsonl`) with the ground-truth answers (`data/longmemeval_oracle.json`). It creates a new file containing these judgments.
 
-```bash
-python evaluation_scripts/evaluate_qa.py
-```
+**Prerequisite: Set Your API Key**
+For this step to work, you must provide an OpenAI API key. The most reliable method is to prepend it to the command.
 
-### Step 2: Print the Final Metrics
-
-This script reads the `results.json` file and prints the final accuracy and other relevant metrics to the console.
+**Run the Evaluation**
+Use the following command, replacing `sk-...` with your key. The script requires three arguments: the metric model, the hypothesis file, and the reference file.
 
 ```bash
-python evaluation_scripts/print_qa_metrics.py
+OPENAI_API_KEY="sk-..." python evaluation_scripts/evaluate_qa.py gpt-4o-mini memgpt_hypotheses.jsonl data/longmemeval_oracle.json
 ```
+
+This command will create a new results file, such as `memgpt_hypotheses.jsonl.eval-results-gpt-4o-mini`.
+
+### Step 2: Print the Final Metrics (`print_qa_metrics.py`)
+
+This script takes the results from the previous step and prints a clean, final report of the accuracy, broken down by task. It requires two arguments: the evaluation results file from Step 1 and the original reference file.
+
+**Run the Metrics Script**
+```bash
+python evaluation_scripts/print_qa_metrics.py memgpt_hypotheses.jsonl.eval-results-gpt-4o-mini data/longmemeval_oracle.json
+```
+
+This will display the final accuracy scores in your terminal.
 
 ## How to Test Your Own MemGPT Modifications
 
