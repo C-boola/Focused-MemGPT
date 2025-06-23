@@ -189,10 +189,15 @@ class Agent(object):
         llm_config: Optional[LLMConfig] = None,
         embedding_config: Optional[EmbeddingConfig] = None,
         mem_mode: Optional[str] = "focus",  # new memory mode parameter
+        beta: Optional[float] = 0.5,  # new beta parameter for hybrid mode (0-1)
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
     ):
+        # Validate beta parameter
+        if beta is not None and (beta < 0.0 or beta > 1.0):
+            raise ValueError(f"Beta parameter must be between 0.0 and 1.0, got {beta}")
+        
         # An agent can be created from a Preset object
         if preset is not None:
             assert agent_state is None, "Can create an agent from a Preset or AgentState (but both were provided)"
@@ -216,9 +221,11 @@ class Agent(object):
                     "functions": preset.functions_schema,
                     "messages": None,
                     "mem_mode": mem_mode if mem_mode is not None else "focus", # Store mem_mode from preset creation
+                    "beta": beta if beta is not None else 0.5, # Store beta from preset creation
                 },
             )
             self.mem_mode = mem_mode if mem_mode is not None else "focus"
+            self.beta = beta if beta is not None else 0.5
 
         # An agent can also be created directly from AgentState
         elif agent_state is not None:
@@ -228,6 +235,7 @@ class Agent(object):
             # Assume the agent_state passed in is formatted correctly
             init_agent_state = agent_state
             self.mem_mode = agent_state.state.get("mem_mode", "fifo") # Load mem_mode from state
+            self.beta = agent_state.state.get("beta", 0.5) # Load beta from state
 
         else:
             raise ValueError("Both Preset and AgentState were null (must provide one or the other)")
@@ -948,6 +956,64 @@ class Agent(object):
                         print(f"Error during focus mode context overflow handling (embedding/distance phase): {emb_e}")
                         # If embedding generation or processing itself fails, re-raise the original overflow error.
                         raise e # Re-raise the original overflow error
+                elif self.mem_mode == "hybrid":
+                    print("=" * 70)
+                    print("  ||  CONTEXT OVERFLOW - HYBRID MODE ACTIVATED - PRE-SUMMARY DIAGNOSTICS  ||")
+                    print("=" * 70)
+                    
+                    original_user_message_text = user_message.text if isinstance(user_message, Message) else str(user_message)
+                    print(f"Hybrid Pre-Summary: Original user_message causing overflow (text snippet): {original_user_message_text[:200]}...")
+                    print(f"Hybrid Pre-Summary: Current self._messages count: {len(self._messages)}")
+                    print(f"Hybrid Pre-Summary: Beta parameter: {self.beta}")
+                    current_messages_tokens = 0
+                    for i, msg_obj in enumerate(self._messages):
+                        role = msg_obj.role
+                        content_snippet = msg_obj.text[:100] if msg_obj.text else "[No text content]"
+                        msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
+                        current_messages_tokens += msg_tokens
+                        print(f"  [{i}] Role: {role}, ID: {msg_obj.id}, Tokens: {msg_tokens}, Content: '{content_snippet}...'")
+                    print(f"Hybrid Pre-Summary: Total tokens in self._messages: {current_messages_tokens}")
+                    
+                    # Estimate tokens if current user_message was added
+                    user_message_tokens_for_diag = count_tokens(str(user_message.to_openai_dict() if isinstance(user_message, Message) else {"role": "user", "content": str(user_message)}))
+                    print(f"Hybrid Pre-Summary: Tokens in current user_message: {user_message_tokens_for_diag}")
+                    print(f"Hybrid Pre-Summary: Estimated total tokens IF user_message was appended (before summary): {current_messages_tokens + user_message_tokens_for_diag}")
+                    
+                    print(f"Context overflow in 'hybrid' mode. Attempting hybrid summarization with beta={self.beta}.")
+                    try:
+                        self.summarize_messages_hybrid_inplace()
+                        
+                        print("-" * 70)
+                        print("  ||  HYBRID MODE - POST-SUMMARY DIAGNOSTICS (BEFORE RETRY)  ||")
+                        print("-" * 70)
+                        
+                        user_message_for_retry_text = user_message.text if isinstance(user_message, Message) else str(user_message)
+                        print(f"Hybrid Post-Summary: User_message for retry (text snippet): {user_message_for_retry_text[:200]}...")
+                        print(f"Hybrid Post-Summary: New self._messages count: {len(self._messages)}")
+                        new_messages_tokens = 0
+                        for i, msg_obj in enumerate(self._messages):
+                            role = msg_obj.role
+                            content_snippet = msg_obj.text[:100] if msg_obj.text else "[No text content]"
+                            msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
+                            new_messages_tokens += msg_tokens
+                            print(f"  [{i}] Role: {role}, ID: {msg_obj.id}, Tokens: {msg_tokens}, Content: '{content_snippet}...'")
+                        print(f"Hybrid Post-Summary: Total tokens in new self._messages: {new_messages_tokens}")
+                        
+                        user_message_tokens_for_retry_diag = count_tokens(str(user_message.to_openai_dict() if isinstance(user_message, Message) else {"role": "user", "content": str(user_message)}))
+                        print(f"Hybrid Post-Summary: Tokens in user_message for retry: {user_message_tokens_for_retry_diag}")
+                        estimated_tokens_for_retry_api_call = new_messages_tokens + user_message_tokens_for_retry_diag
+                        print(f"Hybrid Post-Summary: Estimated total tokens for API call in retry: {estimated_tokens_for_retry_api_call}")
+                        print(f"Hybrid Post-Summary: LLM context window: {self.agent_state.llm_config.context_window}")
+                        
+                        # Try step again
+                        print("Hybrid mode: Summarization complete, retrying step.")
+                        return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
+                    except LLMError as hybrid_sum_e: # Catch specific error from our hybrid summarizer
+                        print(f"{CLI_WARNING_PREFIX}Hybrid mode summarization failed: {hybrid_sum_e}. Re-raising original overflow error to halt.")
+                        raise e # Re-raise the original overflow error (e, not hybrid_sum_e, to keep original trace if needed)
+                    except Exception as general_sum_e: # Catch any other unexpected error during summarization
+                        print(f"{CLI_WARNING_PREFIX}Unexpected error during hybrid mode summarization: {general_sum_e}. Re-raising original overflow error to halt.")
+                        raise e # Re-raise the original overflow error
                 else:
                     # Default to FIFO if mode is unrecognized
                     print(f"Context overflow in unrecognized mem_mode '{self.mem_mode}', defaulting to FIFO summarization.")
@@ -1232,6 +1298,194 @@ class Agent(object):
         final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
         print(f"Focus summarize: Completed. Original messages: {original_message_count}, New messages: {len(self._messages)}. Original tokens: {current_total_tokens}, Approx Freed: {tokens_freed_so_far}, Final tokens: {final_token_count}.")
 
+    def summarize_messages_hybrid_inplace(self):
+        """Hybrid summarization that combines FIFO and focus approaches using beta weighting.
+        
+        Beta = 1.0: Pure focus mode (distance-based)
+        Beta = 0.0: Pure FIFO mode (chronological)
+        Beta = 0.5: Equal weighting of both approaches
+        """
+        print("HYBRID MODE: Summarizing messages using hybrid approach (FIFO + Focus).")
+        if not self._messages or len(self._messages) <= 1:  # Must have more than system message
+            raise LLMError("Hybrid summarize error: Not enough messages to process for summarization.")
+
+        # Ensure context window is known
+        if self.agent_state.llm_config.context_window is None:
+            print(f"{CLI_WARNING_PREFIX}Hybrid summarize: context_window missing in agent config, setting to default.")
+            self.agent_state.llm_config.context_window = (
+                LLM_MAX_TOKENS.get(self.model, LLM_MAX_TOKENS["DEFAULT"])
+            )
+        context_window = int(self.agent_state.llm_config.context_window)
+        target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+
+        # Calculate current total tokens from self._messages
+        current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Hybrid summarize: Current tokens: {current_total_tokens}, Target tokens after summarization: {target_token_count}")
+
+        tokens_to_free = current_total_tokens - target_token_count
+        if tokens_to_free <= 0:
+            print(f"Hybrid summarize: No tokens need to be freed (current: {current_total_tokens}, target: {target_token_count}). Skipping summarization.")
+            self.agent_alerted_about_memory_pressure = False
+            return
+
+        print(f"Hybrid summarize: Need to free approximately {tokens_to_free} tokens. Beta={self.beta}")
+
+        # Step 1: Generate message pair embeddings for focus approach
+        print("Hybrid summarize: Generating embeddings for focus component...")
+        try:
+            message_pair_embeddings_with_ids = create_message_pair_embeddings(
+                message_sequence=self._messages, 
+                embedding_config=self.agent_state.embedding_config
+            )
+            if not message_pair_embeddings_with_ids:
+                print("Hybrid summarize: No message pair embeddings generated. Falling back to pure FIFO mode.")
+                self.summarize_messages_inplace()
+                return
+        except Exception as emb_e:
+            print(f"Hybrid summarize: Error generating embeddings: {emb_e}. Falling back to pure FIFO mode.")
+            self.summarize_messages_inplace()
+            return
+
+        # Extract just the embedding vectors for centroid and distance calculation
+        actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
+
+        # Calculate centroid
+        centroid_vec = calculate_centroid(actual_embedding_vectors)
+        if centroid_vec is None:
+            print("Hybrid summarize: Centroid calculation failed. Falling back to pure FIFO mode.")
+            self.summarize_messages_inplace()
+            return
+
+        # Convert list of list to list of np.array for distance calculation
+        np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
+        distances = calculate_cosine_distances(centroid_vec, np_embedding_vectors)
+
+        # Step 2: Create focus scores (distance-based)
+        focus_scores = {}
+        max_distance = max(distances) if distances else 1.0
+        for i, pair_data in enumerate(message_pair_embeddings_with_ids):
+            user_msg_id = pair_data[0]
+            assistant_msg_id = pair_data[1]
+            # Normalize distance (higher distance = higher score for removal)
+            normalized_distance = distances[i] / max_distance if max_distance > 0 else 0.0
+            focus_scores[user_msg_id] = normalized_distance
+            focus_scores[assistant_msg_id] = normalized_distance
+
+        # Step 3: Create FIFO scores (chronological order)
+        fifo_scores = {}
+        # Get only non-system messages for FIFO scoring
+        non_system_messages = [msg for msg in self._messages if msg.role != "system"]
+        total_pairs = len(non_system_messages) // 2  # Rough estimate of pairs
+        
+        # Create FIFO scores where older messages get higher scores (more likely to be removed)
+        for i, msg in enumerate(non_system_messages):
+            if msg.id:
+                # Higher scores for older messages (earlier in history)
+                fifo_score = (total_pairs - (i // 2)) / total_pairs if total_pairs > 0 else 0.0
+                fifo_scores[msg.id] = max(0.0, fifo_score)
+
+        # Step 4: Combine scores using beta weighting
+        hybrid_scores = {}
+        all_message_ids = set(list(focus_scores.keys()) + list(fifo_scores.keys()))
+        
+        for msg_id in all_message_ids:
+            focus_component = focus_scores.get(msg_id, 0.0) * self.beta
+            fifo_component = fifo_scores.get(msg_id, 0.0) * (1.0 - self.beta)
+            hybrid_scores[msg_id] = focus_component + fifo_component
+
+        print(f"Hybrid summarize: Generated {len(hybrid_scores)} hybrid scores (beta={self.beta})")
+
+        # Step 5: Select messages for removal based on hybrid scores
+        message_id_to_message_obj = {msg.id: msg for msg in self._messages if msg.id is not None}
+
+        # Preserve last N messages
+        ids_to_preserve = set()
+        if MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST > 0:
+            relevant_messages_for_preservation = [m for m in self._messages if m.role != "system"]
+            if len(relevant_messages_for_preservation) > MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST:
+                for i in range(1, MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST + 1):
+                    if relevant_messages_for_preservation[-i].id:
+                        ids_to_preserve.add(relevant_messages_for_preservation[-i].id)
+
+        # Sort messages by hybrid score (highest first = most likely to be removed)
+        sorted_message_ids = sorted(hybrid_scores.keys(), key=lambda x: hybrid_scores[x], reverse=True)
+
+        message_ids_to_remove_set = set()
+        tokens_freed_so_far = 0
+
+        for msg_id in sorted_message_ids:
+            if msg_id in ids_to_preserve:
+                continue
+            if msg_id in message_ids_to_remove_set:
+                continue
+
+            msg_obj = message_id_to_message_obj.get(msg_id)
+            if not msg_obj or msg_obj.role == "system":
+                continue
+
+            msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
+            message_ids_to_remove_set.add(msg_id)
+            tokens_freed_so_far += msg_tokens
+
+            print(f"Hybrid summarize: Selected message {msg_id} for removal (hybrid_score: {hybrid_scores[msg_id]:.4f}, tokens: {msg_tokens})")
+
+            if tokens_freed_so_far >= tokens_to_free:
+                break
+
+        if not message_ids_to_remove_set:
+            print(f"{CLI_WARNING_PREFIX}Hybrid summarize: No messages selected for summarization.")
+            raise LLMError("Hybrid summarize: Failed to select any messages for summarization to reduce context pressure.")
+
+        # Step 6: Collect messages for summarization in chronological order
+        actual_messages_for_summarizer_chronological = []
+        for msg_obj in self._messages:
+            if msg_obj.id in message_ids_to_remove_set:
+                actual_messages_for_summarizer_chronological.append(msg_obj.to_openai_dict())
+
+        if not actual_messages_for_summarizer_chronological:
+            raise LLMError("Hybrid summarize: Messages were marked for removal, but could not be collected for the summarizer.")
+
+        # Step 7: Generate summary
+        print(f"Hybrid summarize: Summarizing {len(actual_messages_for_summarizer_chronological)} messages.")
+        summary_text = summarize_messages(
+            agent_state=self.agent_state,
+            message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+        )
+
+        # Step 8: Create summary message
+        num_original_messages_summarized = len(actual_messages_for_summarizer_chronological)
+        summary_insert_content = f"[Hybrid Summary (β={self.beta}): condensed {num_original_messages_summarized} messages using combined FIFO and focus-based selection]:\n{summary_text}"
+
+        summary_message_to_prepend = Message.dict_to_message(
+            agent_id=self.agent_state.id,
+            user_id=self.agent_state.user_id,
+            model=self.model, 
+            openai_message_dict={"role": "user", "content": summary_insert_content}
+        )
+
+        # Step 9: Remove selected messages and add summary
+        original_message_count = len(self._messages)
+        new_messages_list = [msg for msg in self._messages if msg.id not in message_ids_to_remove_set]
+
+        # Clean up persistence manager
+        if isinstance(self.persistence_manager, LocalStateManager):
+            deleted_count_pm = 0
+            for msg_id_to_delete in message_ids_to_remove_set:
+                try:
+                    if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
+                        self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
+                        deleted_count_pm += 1
+                except Exception as del_e:
+                    print(f"{CLI_WARNING_PREFIX}Hybrid summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
+            print(f"Hybrid summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
+
+        self._messages = new_messages_list
+        self._prepend_to_messages([summary_message_to_prepend])
+        self.agent_alerted_about_memory_pressure = False
+
+        final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Hybrid summarize: Completed. Original messages: {original_message_count}, New messages: {len(self._messages)}. Original tokens: {current_total_tokens}, Approx Freed: {tokens_freed_so_far}, Final tokens: {final_token_count}.")
+
     def heartbeat_is_paused(self):
         """Check if there's a requested pause on timed heartbeats"""
 
@@ -1357,6 +1611,7 @@ class Agent(object):
             "functions": self.functions,
             "messages": [str(msg.id) for msg in self._messages],
             "mem_mode": self.mem_mode,  # Persist mem_mode
+            "beta": self.beta,  # Persist beta
         }
 
         self.agent_state = AgentState(
