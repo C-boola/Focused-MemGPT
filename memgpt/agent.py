@@ -1155,7 +1155,7 @@ class Agent(object):
             selected_pair_ids_for_summarization.append({'user':user_msg_id, 'assistant':assistant_msg_id}) # Store for chronological collection
             tokens_freed_so_far += pair_tokens
             
-            print(f"Focus summarize: Tentatively selected pair (User: {user_msg_id}, Asst: {assistant_msg_id}) for summarization. Tokens in pair: {pair_tokens}. Total tokens potentially freed: {tokens_freed_so_far}")
+            # print(f"Focus summarize: Tentatively selected pair (User: {user_msg_id}, Asst: {assistant_msg_id}) for summarization. Tokens in pair: {pair_tokens}. Total tokens potentially freed: {tokens_freed_so_far}")
 
             if tokens_freed_so_far >= tokens_to_free:
                 break
