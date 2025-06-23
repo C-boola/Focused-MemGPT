@@ -334,6 +334,7 @@ def calculate_centroid(embedding_vectors: List[List[float]]) -> Optional[np.ndar
     
     # Calculate the mean across the 0-th axis (column-wise mean for each dimension)
     centroid = np.mean(vectors_array, axis=0)
+    print("Successfully calculated centroid")
     return centroid
 
 
