@@ -54,10 +54,12 @@ class SilentInterface(AgentInterface):
             print(f"[MEMORY] Function: {msg}")
 
 # --- Constants ---
+memory_mode = "hybrid"
+
 MODULE_BASE_PATH = os.path.dirname(__file__)
 DATA_PATH = os.path.join(MODULE_BASE_PATH, "data", "longmemeval_s.json")
 ORACLE_PATH = os.path.join(MODULE_BASE_PATH, "data", "longmemeval_oracle.json")
-OUTPUT_PATH = os.path.join(MODULE_BASE_PATH, "memgpt_hypotheses.jsonl")
+# OUTPUT_PATH will be set dynamically in main() based on mode and beta
 
 FOCUSED_QUESTION_TYPES = {
     "single-session-user",
@@ -91,13 +93,13 @@ def load_and_filter_data() -> list[dict]:
         print("CRITICAL WARNING: No test cases were loaded after filtering. Please check data files and question types.")
     return filtered_data
 
-def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: str = "focus") -> str:
+def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: str = "focus", beta: float = 0.5) -> str:
     """
     Directly instantiates and controls a MemGPT Agent to run a test case.
     """
     q_id = test_case['question_id']
     agent_name = f"longmemeval_agent_{q_id}"
-    log_debug(f"--- Starting Test Instance: {q_id} (Memory Mode: {memory_mode}) ---")
+    log_debug(f"--- Starting Test Instance: {q_id} (Memory Mode: {memory_mode}, Beta: {beta}) ---")
     
     # 1. Direct Agent Creation (in-memory)
     dummy_user_id = uuid.uuid4()
@@ -122,12 +124,13 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
             "functions": functions_schema,
             "messages": None,
             "mem_mode": memory_mode,  # Explicitly set memory mode
+            "beta": beta,  # Explicitly set beta parameter
         },
     )
 
     try:
-        agent = Agent(interface=SilentInterface(), agent_state=agent_state, mem_mode=memory_mode)
-        log_debug(f"Successfully created agent '{agent.agent_state.name}' with memory mode: {memory_mode}")
+        agent = Agent(interface=SilentInterface(), agent_state=agent_state, mem_mode=memory_mode, beta=beta)
+        log_debug(f"Successfully created agent '{agent.agent_state.name}' with memory mode: {memory_mode}, beta: {beta}")
     except Exception as e:
         log_debug(f"FATAL ERROR in instance {q_id}: Could not instantiate Agent object. Error: {e}")
         traceback.print_exc()
@@ -224,6 +227,13 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
                     log_debug("No embeddings generated, falling back to FIFO.")
                     agent.summarize_messages_inplace()
                     
+            elif memory_mode == "hybrid":
+                print("=" * 70)
+                print("  ||  MANUAL HYBRID MODE SUMMARIZATION TRIGGERED  ||")
+                print("=" * 70)
+                agent.summarize_messages_hybrid_inplace()
+                log_debug("Hybrid mode summarization completed successfully.")
+                
             else:  # FIFO mode
                 print("=" * 70)
                 print("  ||  MANUAL FIFO MODE SUMMARIZATION TRIGGERED  ||")
@@ -356,7 +366,7 @@ def main():
             mode_index = args.index("--mode") + 1
             if mode_index < len(args):
                 specified_mode = args[mode_index]
-                if specified_mode in ["focus", "fifo"]:
+                if specified_mode in ["focus", "fifo", "hybrid"]:
                     memory_mode = specified_mode
                 else:
                     print(f"Warning: Invalid memory mode '{specified_mode}'. Defaulting to 'focus'.")
@@ -365,9 +375,34 @@ def main():
         except (ValueError, IndexError):
             print("Error parsing --mode flag. Defaulting to 'focus'.")
 
+    beta = 0.5  # Default beta
+    if "--beta" in args:
+        try:
+            beta_index = args.index("--beta") + 1
+            if beta_index < len(args):
+                specified_beta = float(args[beta_index])
+                if 0.0 <= specified_beta <= 1.0:
+                    beta = specified_beta
+                else:
+                    print(f"Warning: Beta must be between 0.0 and 1.0, got {specified_beta}. Defaulting to 0.5.")
+            else:
+                print("Warning: --beta flag used without a value. Defaulting to 0.5.")
+        except (ValueError, IndexError):
+            print("Error parsing --beta flag (must be a number between 0.0 and 1.0). Defaulting to 0.5.")
+
     if test_mode:
         print("RUNNING IN TEST MODE - Will process only first 3 cases with verbose output")
     print(f"Using memory mode: {memory_mode.upper()}")
+    if memory_mode == "hybrid":
+        print(f"Using beta parameter: {beta}")
+    else:
+        print(f"Beta parameter: {beta} (only used in hybrid mode)")
+    
+    # Create output path based on mode and beta
+    if memory_mode == "hybrid" and beta != 0.5:
+        output_path = os.path.join(MODULE_BASE_PATH, f"memgpt_hypotheses_{memory_mode}_beta{beta}.jsonl")
+    else:
+        output_path = os.path.join(MODULE_BASE_PATH, f"memgpt_hypotheses_{memory_mode}.jsonl")
     
     # Load the base config once to pass to each agent instance
     config = MemGPTConfig.load()
@@ -381,19 +416,19 @@ def main():
     
     # --- RESUME LOGIC ---
     completed_question_ids = set()
-    if os.path.exists(OUTPUT_PATH) and not test_mode:
-        log_debug(f"Previous run detected. Checking existing results in: {OUTPUT_PATH}")
+    if os.path.exists(output_path) and not test_mode:
+        log_debug(f"Previous run detected. Checking existing results in: {output_path}")
         try:
-            with open(OUTPUT_PATH, 'r', encoding='utf-8') as f:
+            with open(output_path, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f):
                     try:
                         data = json.loads(line)
                         if 'question_id' in data:
                             completed_question_ids.add(data['question_id'])
                     except json.JSONDecodeError:
-                        log_debug(f"Warning: Corrupted line {line_num+1} found in {OUTPUT_PATH}. Skipping.")
+                        log_debug(f"Warning: Corrupted line {line_num+1} found in {output_path}. Skipping.")
         except Exception as e:
-            log_debug(f"Error reading existing results file {OUTPUT_PATH}: {e}. Starting fresh.")
+            log_debug(f"Error reading existing results file {output_path}: {e}. Starting fresh.")
             completed_question_ids = set()
 
     remaining_test_cases = [case for case in test_cases if case['question_id'] not in completed_question_ids]
@@ -404,10 +439,10 @@ def main():
         print(f"\nStarting {'test' if test_mode else 'benchmark'} run on {len(remaining_test_cases)} {'test' if test_mode else 'filtered'} cases.")
     
     # Use different output file for test mode
-    output_path = OUTPUT_PATH + ".test" if test_mode else OUTPUT_PATH
+    final_output_path = output_path + ".test" if test_mode else output_path
     
     # --- GRACEFUL INTERRUPT & APPEND LOGIC ---
-    with open(output_path, 'w' if test_mode else 'a', encoding='utf-8') as outfile:
+    with open(final_output_path, 'w' if test_mode else 'a', encoding='utf-8') as outfile:
         try:
             for case in tqdm(remaining_test_cases, desc="Overall Progress"):
                 if test_mode:
@@ -419,7 +454,7 @@ def main():
                     print(f"TOTAL TURNS: {total_turns}")
                     print(f"{'='*50}")
                 
-                hypothesis = run_test_instance(config, case, memory_mode=memory_mode)
+                hypothesis = run_test_instance(config, case, memory_mode=memory_mode, beta=beta)
                 
                 result = {
                     "question_id": case['question_id'],
@@ -438,7 +473,7 @@ def main():
             print("To resume, simply run the script again.")
             
     print(f"\n===== {'TEST' if test_mode else 'BENCHMARK'} RUN COMPLETE =====")
-    print(f"All hypotheses have been generated and saved to:\n{output_path}")
+    print(f"All hypotheses have been generated and saved to:\n{final_output_path}")
 
 if __name__ == "__main__":
     main()

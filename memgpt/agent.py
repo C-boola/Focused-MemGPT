@@ -188,7 +188,7 @@ class Agent(object):
         name: Optional[str] = None,
         llm_config: Optional[LLMConfig] = None,
         embedding_config: Optional[EmbeddingConfig] = None,
-        mem_mode: Optional[str] = "focus",  # new memory mode parameter
+        mem_mode: Optional[str] = "hybrid",  # new memory mode parameter
         beta: Optional[float] = 0.5,  # new beta parameter for hybrid mode (0-1)
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
