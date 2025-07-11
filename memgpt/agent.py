@@ -7,6 +7,8 @@ import traceback
 from typing import List, Tuple, Optional, cast, Union
 from tqdm import tqdm
 import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 from memgpt.metadata import MetadataStore
 from memgpt.agent_store.storage import StorageConnector, TableType
@@ -46,7 +48,7 @@ from memgpt.constants import (
 )
 from .errors import LLMError
 from .functions.functions import USER_FUNCTIONS_DIR, load_all_function_sets
-from memgpt.embeddings import create_message_pair_embeddings, calculate_centroid, calculate_cosine_distances
+from memgpt.embeddings import create_embedding, calculate_centroid, calculate_cosine_distances
 
 
 def link_functions(function_schemas: list):
@@ -190,6 +192,7 @@ class Agent(object):
         embedding_config: Optional[EmbeddingConfig] = None,
         mem_mode: Optional[str] = "hybrid",  # new memory mode parameter
         beta: Optional[float] = 0.5,  # new beta parameter for hybrid mode (0-1)
+        cluster_summaries: Optional[bool] = False,  # new clustering parameter
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
@@ -222,10 +225,12 @@ class Agent(object):
                     "messages": None,
                     "mem_mode": mem_mode if mem_mode is not None else "focus", # Store mem_mode from preset creation
                     "beta": beta if beta is not None else 0.5, # Store beta from preset creation
+                    "cluster_summaries": cluster_summaries if cluster_summaries is not None else False, # Store cluster_summaries from preset creation
                 },
             )
             self.mem_mode = mem_mode if mem_mode is not None else "focus"
             self.beta = beta if beta is not None else 0.5
+            self.cluster_summaries = cluster_summaries if cluster_summaries is not None else False
 
         # An agent can also be created directly from AgentState
         elif agent_state is not None:
@@ -236,6 +241,7 @@ class Agent(object):
             init_agent_state = agent_state
             self.mem_mode = agent_state.state.get("mem_mode", "fifo") # Load mem_mode from state
             self.beta = agent_state.state.get("beta", 0.5) # Load beta from state
+            self.cluster_summaries = agent_state.state.get("cluster_summaries", False) # Load cluster_summaries from state
 
         else:
             raise ValueError("Both Preset and AgentState were null (must provide one or the other)")
@@ -873,7 +879,7 @@ class Agent(object):
                     
                     print(f"Context overflow in 'focus' mode. Attempting to generate message pair embeddings.")
                     try:
-                        message_pair_embeddings_with_ids = create_message_pair_embeddings(
+                        message_pair_embeddings_with_ids = self._create_robust_message_pair_embeddings(
                             message_sequence=self._messages, 
                             embedding_config=self.agent_state.embedding_config
                         )
@@ -1243,10 +1249,37 @@ class Agent(object):
              raise LLMError("Focus summarize: Messages were marked for removal, but could not be collected for the summarizer. Internal logic error.")
 
         print(f"Focus summarize: Summarizing {len(actual_messages_for_summarizer_chronological)} individual messages from ({len(message_ids_to_remove_set)//2} pairs), in chronological order.")
-        summary_text = summarize_messages(
-            agent_state=self.agent_state,
-            message_sequence_to_summarize=actual_messages_for_summarizer_chronological
-        )
+        
+        # Use cluster-based summarization if enabled
+        if self.cluster_summaries:
+            print("Focus summarize: Cluster-based summarization enabled, generating embeddings for clustering...")
+            try:
+                # Generate message pair embeddings for clustering
+                message_pair_embeddings_with_ids = self._create_robust_message_pair_embeddings(
+                    message_sequence=self._messages, 
+                    embedding_config=self.agent_state.embedding_config
+                )
+                if not message_pair_embeddings_with_ids:
+                    print("Focus summarize: No message pair embeddings generated. Falling back to regular summarization.")
+                    raise Exception("No embeddings generated")
+                
+                cluster_assignments = self.cluster_messages_for_summarization(message_pair_embeddings_with_ids)
+                summary_text = self.summarize_messages_by_clusters(message_ids_to_remove_set, cluster_assignments, tokens_to_free)
+                summary_mode = "Focus+Cluster"
+            except Exception as cluster_e:
+                print(f"Focus summarize: Clustering failed ({cluster_e}), falling back to regular summarization")
+                summary_text = summarize_messages(
+                    agent_state=self.agent_state,
+                    message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+                )
+                summary_mode = "Focus"
+        else:
+            summary_text = summarize_messages(
+                agent_state=self.agent_state,
+                message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+            )
+            summary_mode = "Focus"
+        
         print(f"Focus summarize: Got summary: {summary_text}")
 
         # Package summary message using the standard utility
@@ -1262,7 +1295,7 @@ class Agent(object):
         # For now, let's consider 'hidden' as those we just summarized.
         # The existing `package_summarize_message` is tied to FIFO logic's view of history.
         # We will create a slightly different summary string for focus mode.
-        summary_insert_content = f"[Focus Summary: condensed {num_original_messages_summarized} prior messages that were less central to the recent conversation flow]:\n{summary_text}"
+        summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} prior messages that were less central to the recent conversation flow]:\n{summary_text}"
 
         summary_message_to_prepend = Message.dict_to_message(
             agent_id=self.agent_state.id,
@@ -1333,7 +1366,7 @@ class Agent(object):
         # Step 1: Generate message pair embeddings for focus approach
         print("Hybrid summarize: Generating embeddings for focus component...")
         try:
-            message_pair_embeddings_with_ids = create_message_pair_embeddings(
+            message_pair_embeddings_with_ids = self._create_robust_message_pair_embeddings(
                 message_sequence=self._messages, 
                 embedding_config=self.agent_state.embedding_config
             )
@@ -1360,45 +1393,42 @@ class Agent(object):
         np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
         distances = calculate_cosine_distances(centroid_vec, np_embedding_vectors)
 
-        # Step 2: Create focus scores (distance-based)
-        focus_scores = {}
+        # Step 2: Create focus scores (distance-based, for pairs)
+        pair_focus_scores = {}
         max_distance = max(distances) if distances else 1.0
         for i, pair_data in enumerate(message_pair_embeddings_with_ids):
             user_msg_id = pair_data[0]
             assistant_msg_id = pair_data[1]
             # Normalize distance (higher distance = higher score for removal)
             normalized_distance = distances[i] / max_distance if max_distance > 0 else 0.0
-            focus_scores[user_msg_id] = normalized_distance
-            focus_scores[assistant_msg_id] = normalized_distance
+            pair_focus_scores[(user_msg_id, assistant_msg_id)] = normalized_distance
 
-        # Step 3: Create FIFO scores (chronological order)
-        fifo_scores = {}
-        # Get only non-system messages for FIFO scoring
-        non_system_messages = [msg for msg in self._messages if msg.role != "system"]
-        total_pairs = len(non_system_messages) // 2  # Rough estimate of pairs
+        # Step 3: Create FIFO scores (chronological order, for pairs)
+        pair_fifo_scores = {}
+        total_pairs = len(message_pair_embeddings_with_ids)
         
-        # Create FIFO scores where older messages get higher scores (more likely to be removed)
-        for i, msg in enumerate(non_system_messages):
-            if msg.id:
-                # Higher scores for older messages (earlier in history)
-                fifo_score = (total_pairs - (i // 2)) / total_pairs if total_pairs > 0 else 0.0
-                fifo_scores[msg.id] = max(0.0, fifo_score)
+        # Create FIFO scores where older pairs get higher scores (more likely to be removed)
+        for i, pair_data in enumerate(message_pair_embeddings_with_ids):
+            user_msg_id = pair_data[0]
+            assistant_msg_id = pair_data[1]
+            # Higher scores for older pairs (earlier in history)
+            fifo_score = (total_pairs - i) / total_pairs if total_pairs > 0 else 0.0
+            pair_fifo_scores[(user_msg_id, assistant_msg_id)] = max(0.0, fifo_score)
 
         # Step 4: Combine scores using beta weighting
-        hybrid_scores = {}
-        all_message_ids = set(list(focus_scores.keys()) + list(fifo_scores.keys()))
+        pair_hybrid_scores = {}
         
-        for msg_id in all_message_ids:
-            focus_component = focus_scores.get(msg_id, 0.0) * self.beta
-            fifo_component = fifo_scores.get(msg_id, 0.0) * (1.0 - self.beta)
-            hybrid_scores[msg_id] = focus_component + fifo_component
+        for pair_key in pair_focus_scores.keys():
+            focus_component = pair_focus_scores.get(pair_key, 0.0) * self.beta
+            fifo_component = pair_fifo_scores.get(pair_key, 0.0) * (1.0 - self.beta)
+            pair_hybrid_scores[pair_key] = focus_component + fifo_component
 
-        print(f"Hybrid summarize: Generated {len(hybrid_scores)} hybrid scores (beta={self.beta})")
+        print(f"Hybrid summarize: Generated {len(pair_hybrid_scores)} hybrid pair scores (beta={self.beta})")
 
-        # Step 5: Select messages for removal based on hybrid scores
+        # Step 5: Select message pairs for removal based on hybrid scores (PAIR-BASED SELECTION)
         message_id_to_message_obj = {msg.id: msg for msg in self._messages if msg.id is not None}
 
-        # Preserve last N messages
+        # Preserve last N messages (operate on pairs)
         ids_to_preserve = set()
         if MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST > 0:
             relevant_messages_for_preservation = [m for m in self._messages if m.role != "system"]
@@ -1407,34 +1437,51 @@ class Agent(object):
                     if relevant_messages_for_preservation[-i].id:
                         ids_to_preserve.add(relevant_messages_for_preservation[-i].id)
 
-        # Sort messages by hybrid score (highest first = most likely to be removed)
-        sorted_message_ids = sorted(hybrid_scores.keys(), key=lambda x: hybrid_scores[x], reverse=True)
+        # Sort pairs by hybrid score (highest first = most likely to be removed)
+        sorted_pairs_by_score = sorted(pair_hybrid_scores.items(), key=lambda x: x[1], reverse=True)
 
         message_ids_to_remove_set = set()
         tokens_freed_so_far = 0
 
-        for msg_id in sorted_message_ids:
-            if msg_id in ids_to_preserve:
+        # Use PAIR-BASED selection (same as focus mode)
+        for (user_msg_id, assistant_msg_id), hybrid_score in sorted_pairs_by_score:
+            # Skip if either message in the pair is in the preserve list
+            if user_msg_id in ids_to_preserve or assistant_msg_id in ids_to_preserve:
+                print(f"Hybrid summarize: Skipping pair (User: {user_msg_id}, Asst: {assistant_msg_id}) as it's in preserve list.")
                 continue
-            if msg_id in message_ids_to_remove_set:
+            
+            # Skip if already marked for removal
+            if user_msg_id in message_ids_to_remove_set or assistant_msg_id in message_ids_to_remove_set:
                 continue
 
-            msg_obj = message_id_to_message_obj.get(msg_id)
-            if not msg_obj or msg_obj.role == "system":
+            user_msg_obj = message_id_to_message_obj.get(user_msg_id)
+            assistant_msg_obj = message_id_to_message_obj.get(assistant_msg_id)
+
+            if not user_msg_obj or not assistant_msg_obj:
+                print(f"{CLI_WARNING_PREFIX}Hybrid summarize: Could not find message objects for pair (User: {user_msg_id}, Asst: {assistant_msg_id}). Skipping.")
+                continue
+            
+            # Skip if either message is a system message
+            if user_msg_obj.role == "system" or assistant_msg_obj.role == "system":
+                print(f"{CLI_WARNING_PREFIX}Hybrid summarize: Attempted to select a system message in pair ({user_msg_id}, {assistant_msg_id}). Skipping.")
                 continue
 
-            msg_tokens = count_tokens(str(msg_obj.to_openai_dict()))
-            message_ids_to_remove_set.add(msg_id)
-            tokens_freed_so_far += msg_tokens
+            # Calculate tokens for the entire pair
+            pair_tokens = count_tokens(str(user_msg_obj.to_openai_dict())) + count_tokens(str(assistant_msg_obj.to_openai_dict()))
+            
+            # Add BOTH messages from the pair (maintain conversation integrity)
+            message_ids_to_remove_set.add(user_msg_id)
+            message_ids_to_remove_set.add(assistant_msg_id)
+            tokens_freed_so_far += pair_tokens
 
-            print(f"Hybrid summarize: Selected message {msg_id} for removal (hybrid_score: {hybrid_scores[msg_id]:.4f}, tokens: {msg_tokens})")
+            print(f"Hybrid summarize: Selected pair (User: {user_msg_id}, Asst: {assistant_msg_id}) for removal (hybrid_score: {hybrid_score:.4f}, tokens: {pair_tokens})")
 
             if tokens_freed_so_far >= tokens_to_free:
                 break
 
         if not message_ids_to_remove_set:
-            print(f"{CLI_WARNING_PREFIX}Hybrid summarize: No messages selected for summarization.")
-            raise LLMError("Hybrid summarize: Failed to select any messages for summarization to reduce context pressure.")
+            print(f"{CLI_WARNING_PREFIX}Hybrid summarize: No message pairs selected for summarization.")
+            raise LLMError("Hybrid summarize: Failed to select any message pairs for summarization to reduce context pressure.")
 
         # Step 6: Collect messages for summarization in chronological order
         actual_messages_for_summarizer_chronological = []
@@ -1446,15 +1493,32 @@ class Agent(object):
             raise LLMError("Hybrid summarize: Messages were marked for removal, but could not be collected for the summarizer.")
 
         # Step 7: Generate summary
-        print(f"Hybrid summarize: Summarizing {len(actual_messages_for_summarizer_chronological)} messages.")
-        summary_text = summarize_messages(
-            agent_state=self.agent_state,
-            message_sequence_to_summarize=actual_messages_for_summarizer_chronological
-        )
+        print(f"Hybrid summarize: Summarizing {len(actual_messages_for_summarizer_chronological)} messages from {len(message_ids_to_remove_set)//2} pairs.")
+        
+        # Use cluster-based summarization if enabled
+        if self.cluster_summaries:
+            print("Hybrid summarize: Cluster-based summarization enabled, performing clustering...")
+            try:
+                cluster_assignments = self.cluster_messages_for_summarization(message_pair_embeddings_with_ids)
+                summary_text = self.summarize_messages_by_clusters(message_ids_to_remove_set, cluster_assignments, tokens_to_free)
+                summary_mode = f"Hybrid+Cluster (β={self.beta})"
+            except Exception as cluster_e:
+                print(f"Hybrid summarize: Clustering failed ({cluster_e}), falling back to regular summarization")
+                summary_text = summarize_messages(
+                    agent_state=self.agent_state,
+                    message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+                )
+                summary_mode = f"Hybrid (β={self.beta})"
+        else:
+            summary_text = summarize_messages(
+                agent_state=self.agent_state,
+                message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+            )
+            summary_mode = f"Hybrid (β={self.beta})"
 
         # Step 8: Create summary message
         num_original_messages_summarized = len(actual_messages_for_summarizer_chronological)
-        summary_insert_content = f"[Hybrid Summary (β={self.beta}): condensed {num_original_messages_summarized} messages using combined FIFO and focus-based selection]:\n{summary_text}"
+        summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} messages using combined FIFO and focus-based pair selection]:\n{summary_text}"
 
         summary_message_to_prepend = Message.dict_to_message(
             agent_id=self.agent_state.id,
@@ -1485,6 +1549,161 @@ class Agent(object):
 
         final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
         print(f"Hybrid summarize: Completed. Original messages: {original_message_count}, New messages: {len(self._messages)}. Original tokens: {current_total_tokens}, Approx Freed: {tokens_freed_so_far}, Final tokens: {final_token_count}.")
+
+    def cluster_messages_for_summarization(self, message_embeddings_with_ids: List[Tuple], min_clusters: int = 2, max_clusters: int = 6) -> dict:
+        """Cluster messages based on their embeddings to group similar topics together.
+        
+        Args:
+            message_embeddings_with_ids: List of tuples (user_msg_id, assistant_msg_id, embedding_vector)
+            min_clusters: Minimum number of clusters to consider
+            max_clusters: Maximum number of clusters to consider
+            
+        Returns:
+            Dictionary mapping message_id -> cluster_id
+        """
+        if len(message_embeddings_with_ids) < min_clusters:
+            print(f"Clustering: Not enough message pairs ({len(message_embeddings_with_ids)}) for clustering. Using single cluster.")
+            # Return all messages in cluster 0
+            cluster_assignments = {}
+            for user_id, assistant_id, _ in message_embeddings_with_ids:
+                cluster_assignments[user_id] = 0
+                cluster_assignments[assistant_id] = 0
+            return cluster_assignments
+
+        # Extract embeddings
+        embeddings = np.array([pair[2] for pair in message_embeddings_with_ids])
+        
+        # Determine optimal number of clusters using silhouette analysis
+        best_score = -1
+        best_k = min_clusters
+        max_k = min(max_clusters, len(message_embeddings_with_ids))
+        
+        print(f"Clustering: Testing {min_clusters} to {max_k} clusters for {len(message_embeddings_with_ids)} message pairs...")
+        
+        for k in range(min_clusters, max_k + 1):
+            try:
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                cluster_labels = kmeans.fit_predict(embeddings)
+                
+                # Calculate silhouette score
+                if len(set(cluster_labels)) > 1:  # Need at least 2 clusters for silhouette score
+                    score = silhouette_score(embeddings, cluster_labels)
+                    print(f"Clustering: k={k}, silhouette_score={score:.4f}")
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_k = k
+                else:
+                    print(f"Clustering: k={k} resulted in only 1 cluster, skipping")
+                    
+            except Exception as e:
+                print(f"Clustering: Error with k={k}: {e}")
+                continue
+        
+        # Perform final clustering with best k
+        print(f"Clustering: Using k={best_k} clusters (silhouette_score={best_score:.4f})")
+        kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+        final_labels = kmeans.fit_predict(embeddings)
+        
+        # Map message IDs to cluster assignments
+        cluster_assignments = {}
+        for i, (user_id, assistant_id, _) in enumerate(message_embeddings_with_ids):
+            cluster_id = int(final_labels[i])
+            cluster_assignments[user_id] = cluster_id
+            cluster_assignments[assistant_id] = cluster_id
+        
+        # Print cluster summary
+        cluster_counts = {}
+        for cluster_id in cluster_assignments.values():
+            cluster_counts[cluster_id] = cluster_counts.get(cluster_id, 0) + 1
+        print(f"Clustering: Cluster distribution: {cluster_counts}")
+        
+        return cluster_assignments
+
+    def summarize_messages_by_clusters(self, message_ids_to_remove_set: set, cluster_assignments: dict, tokens_to_free: int) -> str:
+        """Summarize messages grouped by clusters to avoid diluted topic mixing.
+        
+        Args:
+            message_ids_to_remove_set: Set of message IDs to be summarized
+            cluster_assignments: Dictionary mapping message_id -> cluster_id
+            tokens_to_free: Total number of tokens that need to be freed
+            
+        Returns:
+            Combined summary text from all clusters
+        """
+        print("Cluster-based summarization: Grouping messages by cluster...")
+        
+        # Group messages by cluster
+        message_id_to_message_obj = {msg.id: msg for msg in self._messages if msg.id is not None}
+        clusters = {}
+        cluster_tokens = {}
+        
+        for msg_id in message_ids_to_remove_set:
+            if msg_id not in cluster_assignments:
+                continue  # Skip messages without cluster assignment
+                
+            cluster_id = cluster_assignments[msg_id]
+            if cluster_id not in clusters:
+                clusters[cluster_id] = []
+                cluster_tokens[cluster_id] = 0
+            
+            msg_obj = message_id_to_message_obj.get(msg_id)
+            if msg_obj:
+                clusters[cluster_id].append(msg_obj)
+                cluster_tokens[cluster_id] += count_tokens(str(msg_obj.to_openai_dict()))
+        
+        if not clusters:
+            print("Cluster-based summarization: No clusters found, falling back to regular summarization")
+            # Fallback to regular summarization
+            actual_messages = []
+            for msg_obj in self._messages:
+                if msg_obj.id in message_ids_to_remove_set:
+                    actual_messages.append(msg_obj.to_openai_dict())
+            return summarize_messages(
+                agent_state=self.agent_state,
+                message_sequence_to_summarize=actual_messages
+            )
+        
+        print(f"Cluster-based summarization: Found {len(clusters)} clusters")
+        for cluster_id, msgs in clusters.items():
+            print(f"  Cluster {cluster_id}: {len(msgs)} messages, {cluster_tokens[cluster_id]} tokens")
+        
+        # Generate summary for each cluster
+        cluster_summaries = []
+        total_tokens_in_clusters = sum(cluster_tokens.values())
+        
+        for cluster_id in sorted(clusters.keys()):
+            cluster_messages = clusters[cluster_id]
+            if not cluster_messages:
+                continue
+                
+            # Convert to chronological order
+            cluster_messages_sorted = sorted(cluster_messages, key=lambda x: self._messages.index(x))
+            cluster_messages_dicts = [msg.to_openai_dict() for msg in cluster_messages_sorted]
+            
+            print(f"Cluster-based summarization: Summarizing cluster {cluster_id} with {len(cluster_messages_dicts)} messages...")
+            
+            try:
+                cluster_summary = summarize_messages(
+                    agent_state=self.agent_state,
+                    message_sequence_to_summarize=cluster_messages_dicts
+                )
+                cluster_token_percentage = (cluster_tokens[cluster_id] / total_tokens_in_clusters) * 100
+                cluster_summaries.append(f"Topic Cluster {cluster_id} ({cluster_token_percentage:.1f}% of summarized content): {cluster_summary}")
+                
+            except Exception as e:
+                print(f"Cluster-based summarization: Error summarizing cluster {cluster_id}: {e}")
+                # Fallback: create a simple summary
+                cluster_summaries.append(f"Topic Cluster {cluster_id}: Contains {len(cluster_messages_dicts)} messages [summarization failed: {str(e)}]")
+        
+        # Combine all cluster summaries
+        if len(cluster_summaries) == 1:
+            combined_summary = cluster_summaries[0]
+        else:
+            combined_summary = "Multi-topic summary:\n" + "\n\n".join(cluster_summaries)
+        
+        print(f"Cluster-based summarization: Generated combined summary with {len(cluster_summaries)} topic clusters")
+        return combined_summary
 
     def heartbeat_is_paused(self):
         """Check if there's a requested pause on timed heartbeats"""
@@ -1517,31 +1736,6 @@ class Agent(object):
                 agent_id=self.agent_state.id, user_id=self.agent_state.user_id, model=self.model, openai_message_dict=new_system_message
             )
         )
-
-    # def to_agent_state(self) -> AgentState:
-    #    # The state may have change since the last time we wrote it
-    #    updated_state = {
-    #        "persona": self.memory.persona,
-    #        "human": self.memory.human,
-    #        "system": self.system,
-    #        "functions": self.functions,
-    #        "messages": [str(msg.id) for msg in self._messages],
-    #    }
-
-    #    agent_state = AgentState(
-    #        name=self.agent_state.name,
-    #        user_id=self.agent_state.user_id,
-    #        persona=self.agent_state.persona,
-    #        human=self.agent_state.human,
-    #        llm_config=self.agent_state.llm_config,
-    #        embedding_config=self.agent_state.embedding_config,
-    #        preset=self.agent_state.preset,
-    #        id=self.agent_state.id,
-    #        created_at=self.agent_state.created_at,
-    #        state=updated_state,
-    #    )
-
-    #    return agent_state
 
     def add_function(self, function_name: str) -> str:
         if function_name in self.functions_python.keys():
@@ -1585,24 +1779,6 @@ class Agent(object):
         printd(msg)
         return msg
 
-    # def save(self):
-    #    """Save agent state locally"""
-
-    #    new_agent_state = self.to_agent_state()
-
-    #    # without this, even after Agent.__init__, agent.config.state["messages"] will be None
-    #    self.agent_state = new_agent_state
-
-    #    # Check if we need to create the agent
-    #    if not self.ms.get_agent(agent_id=new_agent_state.id, user_id=new_agent_state.user_id, agent_name=new_agent_state.name):
-    #        # print(f"Agent.save {new_agent_state.id} :: agent does not exist, creating...")
-    #        self.ms.create_agent(agent=new_agent_state)
-    #    # Otherwise, we should update the agent
-    #    else:
-    #        # print(f"Agent.save {new_agent_state.id} :: agent already exists, updating...")
-    #        print(f"Agent.save {new_agent_state.id} :: preupdate:\n\tmessages={new_agent_state.state['messages']}")
-    #        self.ms.update_agent(agent=new_agent_state)
-
     def update_state(self) -> AgentState:
         updated_state = {
             "persona": self.memory.persona,
@@ -1612,6 +1788,7 @@ class Agent(object):
             "messages": [str(msg.id) for msg in self._messages],
             "mem_mode": self.mem_mode,  # Persist mem_mode
             "beta": self.beta,  # Persist beta
+            "cluster_summaries": self.cluster_summaries,  # Persist cluster_summaries
         }
 
         self.agent_state = AgentState(
@@ -1676,6 +1853,83 @@ class Agent(object):
         printd(
             f"Attached data source {source_name} to agent {self.agent_state.name}, consisting of {len(all_passages)}. Agent now has {total_agent_passages} embeddings in archival memory.",
         )
+
+    def _create_robust_message_pair_embeddings(self, message_sequence, embedding_config):
+        """
+        Robust embedding function that works with both JSON and plain text messages.
+        Creates vector embeddings for message pairs (user message and subsequent assistant message).
+        """
+        import json
+        
+        pair_embeddings = []
+        if not message_sequence or len(message_sequence) < 2:
+            return pair_embeddings
+
+        print(f"Creating robust embeddings for {len(message_sequence)} messages...")
+        
+        for i in range(len(message_sequence) - 1):
+            msg1 = message_sequence[i]
+            msg2 = message_sequence[i+1]
+
+            # Look for user-assistant pairs
+            if msg1.role == "user" and msg2.role == "assistant":
+                try:
+                    # Handle both JSON and plain text messages
+                    text1 = ""
+                    text2 = ""
+                    
+                    # Try JSON parsing first (for regular MemGPT messages)
+                    try:
+                        msg1_content = json.loads(msg1.text) if msg1.text else {}
+                        if msg1_content.get('type') == 'user_message':
+                            text1 = msg1_content.get('message', '') or msg1.text
+                        else:
+                            text1 = msg1.text if msg1.text else ""
+                    except (json.JSONDecodeError, TypeError):
+                        # Fall back to plain text (for longmemeval injected messages)
+                        text1 = msg1.text if msg1.text else ""
+                    
+                    # Assistant messages are typically plain text
+                    text2 = msg2.text if msg2.text else ""
+                    
+                    # Skip empty messages or system-like messages
+                    if not text1.strip() or not text2.strip():
+                        continue
+                    
+                    # Skip login messages and other system messages
+                    if any(keyword in text1.lower() for keyword in ['login', 'bootup', 'system']):
+                        continue
+                    
+                    # Ensure IDs are not None
+                    if msg1.id is None or msg2.id is None:
+                        print(f"Warning: Skipping message pair due to missing ID(s). User msg ID: {msg1.id}, Assistant msg ID: {msg2.id}")
+                        continue
+
+                    # Combine the messages
+                    combined_text = text1.strip() + " " + text2.strip()
+
+                    # Skip if combined text is too short
+                    if len(combined_text.strip()) < 20:
+                        continue
+
+                    try:
+                        # Create embedding for the combined text
+                        embedding_vector = create_embedding(
+                            text=combined_text,
+                            embedding_config=embedding_config,
+                        )
+                        pair_embeddings.append((msg1.id, msg2.id, embedding_vector))
+                            
+                    except Exception as e:
+                        print(f"Error creating embedding for pair (user_msg_id={msg1.id}, assistant_msg_id={msg2.id}): {e}")
+                        continue
+                        
+                except Exception as e:
+                    print(f"Error processing message pair at index {i}: {e}")
+                    continue
+
+        print(f"Successfully created {len(pair_embeddings)} message pair embeddings")
+        return pair_embeddings
 
 
 def save_agent(agent: Agent, ms: MetadataStore):

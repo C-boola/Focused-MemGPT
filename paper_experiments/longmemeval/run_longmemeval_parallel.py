@@ -54,7 +54,7 @@ def print_progress_summary():
         
         print(f"{'='*80}\n")
 
-def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False) -> Tuple[float, int, str]:
+def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False, cluster_summaries: bool = False) -> Tuple[float, int, str]:
     """
     Run a single beta value using the original script with real-time output streaming.
     
@@ -72,8 +72,11 @@ def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = 
     cmd = [sys.executable, script_path, "--mode", memory_mode, "--beta", str(beta)]
     if test_mode:
         cmd.append("--test")
+    if cluster_summaries:
+        cmd.append("--cluster")
     
-    print(f"[β={beta}] Starting: {' '.join(cmd)}")
+    clustering_status = " (clustering)" if cluster_summaries else ""
+    print(f"[β={beta}] Starting{clustering_status}: {' '.join(cmd)}")
     
     try:
         # Start the subprocess with real-time output
@@ -206,6 +209,8 @@ def main():
                        help="Ending beta value (default: 1.0)")
     parser.add_argument("--beta-step", type=float, default=0.1,
                        help="Beta increment step (default: 0.1)")
+    parser.add_argument("--cluster", action="store_true",
+                       help="Enable clustering-based summarization (default: disabled)")
     
     args = parser.parse_args()
     
@@ -221,6 +226,7 @@ def main():
     print("=" * 70)
     print(f"Memory mode: {args.mode}")
     print(f"Test mode: {'ON' if args.test else 'OFF'}")
+    print(f"Clustering-based summarization: {'ENABLED' if args.cluster else 'DISABLED'}")
     print(f"Beta values: {beta_values}")
     print(f"Total runs: {len(beta_values)}")
     print(f"Max workers: {args.max_workers if args.max_workers else 'CPU count'}")
@@ -259,7 +265,7 @@ def main():
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Submit all jobs
             future_to_beta = {
-                executor.submit(run_single_beta, beta, args.mode, args.test): beta 
+                executor.submit(run_single_beta, beta, args.mode, args.test, args.cluster): beta 
                 for beta in beta_values
             }
             
@@ -323,10 +329,12 @@ def main():
     script_dir = os.path.dirname(__file__)
     output_files = []
     for beta in beta_values:
+        output_filename = f"memgpt_hypotheses_{args.mode}"
         if args.mode == "hybrid" and beta != 0.5:
-            filename = f"memgpt_hypotheses_{args.mode}_beta{beta}.jsonl"
-        else:
-            filename = f"memgpt_hypotheses_{args.mode}.jsonl"
+            output_filename += f"_beta{beta}"
+        if args.cluster:
+            output_filename += "_cluster"
+        filename = f"{output_filename}.jsonl"
         
         if args.test:
             filename += ".test"

@@ -93,13 +93,13 @@ def load_and_filter_data() -> list[dict]:
         print("CRITICAL WARNING: No test cases were loaded after filtering. Please check data files and question types.")
     return filtered_data
 
-def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: str = "focus", beta: float = 0.5) -> str:
+def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: str = "focus", beta: float = 0.5, cluster_summaries: bool = False) -> str:
     """
     Directly instantiates and controls a MemGPT Agent to run a test case.
     """
     q_id = test_case['question_id']
     agent_name = f"longmemeval_agent_{q_id}"
-    log_debug(f"--- Starting Test Instance: {q_id} (Memory Mode: {memory_mode}, Beta: {beta}) ---")
+    log_debug(f"--- Starting Test Instance: {q_id} (Memory Mode: {memory_mode}, Beta: {beta}, Clustering: {'ON' if cluster_summaries else 'OFF'}) ---")
     
     # 1. Direct Agent Creation (in-memory)
     dummy_user_id = uuid.uuid4()
@@ -125,12 +125,13 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
             "messages": None,
             "mem_mode": memory_mode,  # Explicitly set memory mode
             "beta": beta,  # Explicitly set beta parameter
+            "cluster_summaries": cluster_summaries,  # Explicitly set clustering parameter
         },
     )
 
     try:
-        agent = Agent(interface=SilentInterface(), agent_state=agent_state, mem_mode=memory_mode, beta=beta)
-        log_debug(f"Successfully created agent '{agent.agent_state.name}' with memory mode: {memory_mode}, beta: {beta}")
+        agent = Agent(interface=SilentInterface(), agent_state=agent_state, mem_mode=memory_mode, beta=beta, cluster_summaries=cluster_summaries)
+        log_debug(f"Successfully created agent '{agent.agent_state.name}' with memory mode: {memory_mode}, beta: {beta}, clustering: {'ON' if cluster_summaries else 'OFF'}")
     except Exception as e:
         log_debug(f"FATAL ERROR in instance {q_id}: Could not instantiate Agent object. Error: {e}")
         traceback.print_exc()
@@ -390,6 +391,8 @@ def main():
         except (ValueError, IndexError):
             print("Error parsing --beta flag (must be a number between 0.0 and 1.0). Defaulting to 0.5.")
 
+    cluster_summaries = "--cluster" in args  # Default is False (clustering OFF)
+
     if test_mode:
         print("RUNNING IN TEST MODE - Will process only first 3 cases with verbose output")
     print(f"Using memory mode: {memory_mode.upper()}")
@@ -397,12 +400,17 @@ def main():
         print(f"Using beta parameter: {beta}")
     else:
         print(f"Beta parameter: {beta} (only used in hybrid mode)")
+    print(f"Clustering-based summarization: {'ENABLED' if cluster_summaries else 'DISABLED'}")
     
-    # Create output path based on mode and beta
+    # Create output path based on mode, beta, and clustering
+    output_filename = f"memgpt_hypotheses_prompted_{memory_mode}"
     if memory_mode == "hybrid" and beta != 0.5:
-        output_path = os.path.join(MODULE_BASE_PATH, f"memgpt_hypotheses_{memory_mode}_beta{beta}.jsonl")
-    else:
-        output_path = os.path.join(MODULE_BASE_PATH, f"memgpt_hypotheses_{memory_mode}.jsonl")
+        output_filename += f"_beta{beta}"
+    if cluster_summaries:
+        output_filename += "_cluster"
+    if test_mode:
+        output_filename += "_test"
+    output_path = os.path.join(MODULE_BASE_PATH, f"{output_filename}.jsonl")
     
     # Load the base config once to pass to each agent instance
     config = MemGPTConfig.load()
@@ -411,7 +419,7 @@ def main():
     
     # In test mode, only run first 3 cases
     if test_mode:
-        test_cases = test_cases[:3]
+        test_cases = test_cases[:10]
         print(f"Test mode: Limited to {len(test_cases)} cases")
     
     # --- RESUME LOGIC ---
@@ -454,7 +462,7 @@ def main():
                     print(f"TOTAL TURNS: {total_turns}")
                     print(f"{'='*50}")
                 
-                hypothesis = run_test_instance(config, case, memory_mode=memory_mode, beta=beta)
+                hypothesis = run_test_instance(config, case, memory_mode=memory_mode, beta=beta, cluster_summaries=cluster_summaries)
                 
                 result = {
                     "question_id": case['question_id'],
