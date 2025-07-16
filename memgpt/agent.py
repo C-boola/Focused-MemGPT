@@ -231,6 +231,7 @@ class Agent(object):
             self.mem_mode = mem_mode if mem_mode is not None else "focus"
             self.beta = beta if beta is not None else 0.5
             self.cluster_summaries = cluster_summaries if cluster_summaries is not None else False
+            self.prompt_type = "memgpt_default"  # Default prompt type for preset-based agents
 
         # An agent can also be created directly from AgentState
         elif agent_state is not None:
@@ -242,6 +243,7 @@ class Agent(object):
             self.mem_mode = agent_state.state.get("mem_mode", "fifo") # Load mem_mode from state
             self.beta = agent_state.state.get("beta", 0.5) # Load beta from state
             self.cluster_summaries = agent_state.state.get("cluster_summaries", False) # Load cluster_summaries from state
+            self.prompt_type = agent_state.state.get("prompt_type", "memgpt_default") # Load prompt_type from state
 
         else:
             raise ValueError("Both Preset and AgentState were null (must provide one or the other)")
@@ -1474,7 +1476,7 @@ class Agent(object):
             message_ids_to_remove_set.add(assistant_msg_id)
             tokens_freed_so_far += pair_tokens
 
-            print(f"Hybrid summarize: Selected pair (User: {user_msg_id}, Asst: {assistant_msg_id}) for removal (hybrid_score: {hybrid_score:.4f}, tokens: {pair_tokens})")
+            # print(f"Hybrid summarize: Selected pair (User: {user_msg_id}, Asst: {assistant_msg_id}) for removal (hybrid_score: {hybrid_score:.4f}, tokens: {pair_tokens})")
 
             if tokens_freed_so_far >= tokens_to_free:
                 break
@@ -1515,6 +1517,8 @@ class Agent(object):
                 message_sequence_to_summarize=actual_messages_for_summarizer_chronological
             )
             summary_mode = f"Hybrid (β={self.beta})"
+        
+        print(f"Hybrid summary: {summary_text}")
 
         # Step 8: Create summary message
         num_original_messages_summarized = len(actual_messages_for_summarizer_chronological)
@@ -1789,6 +1793,7 @@ class Agent(object):
             "mem_mode": self.mem_mode,  # Persist mem_mode
             "beta": self.beta,  # Persist beta
             "cluster_summaries": self.cluster_summaries,  # Persist cluster_summaries
+            "prompt_type": self.prompt_type,  # Persist prompt_type
         }
 
         self.agent_state = AgentState(

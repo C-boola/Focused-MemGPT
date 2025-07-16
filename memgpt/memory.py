@@ -5,7 +5,7 @@ from typing import Optional, List, Tuple, Union
 
 from memgpt.constants import MESSAGE_SUMMARY_WARNING_FRAC
 from memgpt.utils import get_local_time, printd, count_tokens, validate_date_format, extract_date_from_timestamp
-from memgpt.prompts.gpt_summarize import SYSTEM as SUMMARY_PROMPT_SYSTEM
+from memgpt.prompts.gpt_summarize import get_system_prompt
 from memgpt.llm_api_tools import create
 from memgpt.data_types import Message, Passage, AgentState
 from memgpt.embeddings import embedding_model, query_embedding, parse_and_chunk_text
@@ -110,7 +110,9 @@ def summarize_messages(
     # we need the context_window
     context_window = agent_state.llm_config.context_window
 
-    summary_prompt = SUMMARY_PROMPT_SYSTEM
+    # Get prompt_type from agent state, default to memgpt_default if not found
+    prompt_type = agent_state.state.get("prompt_type", "memgpt_default")
+    summary_prompt = get_system_prompt(prompt_type)
     summary_input = str(message_sequence_to_summarize)
     summary_input_tkns = count_tokens(summary_input)
     if summary_input_tkns > MESSAGE_SUMMARY_WARNING_FRAC * context_window:
