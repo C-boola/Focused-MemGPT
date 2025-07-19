@@ -54,7 +54,7 @@ def print_progress_summary():
         
         print(f"{'='*80}\n")
 
-def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False, cluster_summaries: bool = False, prompt_type: str = "memgpt_default") -> Tuple[float, int, str]:
+def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid") -> Tuple[float, int, str]:
     """
     Run a single beta value using the original script with real-time output streaming.
     
@@ -71,7 +71,7 @@ def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = 
     script_path = os.path.join(os.path.dirname(__file__), "run_longmemeval.py")
     
     # Build command
-    cmd = [sys.executable, script_path, "--mode", memory_mode, "--beta", str(beta), "--prompt-type", prompt_type]
+    cmd = [sys.executable, script_path, "--mode", memory_mode, "--beta", str(beta), "--prompt-type", prompt_type, "--centroid-method", centroid_method]
     if test_mode:
         cmd.append("--test")
     if cluster_summaries:
@@ -215,6 +215,8 @@ def main():
                        help="Enable clustering-based summarization (default: disabled)")
     parser.add_argument("--prompt-type", choices=["memgpt_default", "xml"], default="memgpt_default",
                        help="Prompt type to use (default: memgpt_default)")
+    parser.add_argument("--centroid-method", choices=["centroid", "medoid"], default="centroid",
+                       help="Method to use for calculating representative vector (default: centroid)")
     
     args = parser.parse_args()
     
@@ -232,6 +234,7 @@ def main():
     print(f"Test mode: {'ON' if args.test else 'OFF'}")
     print(f"Clustering-based summarization: {'ENABLED' if args.cluster else 'DISABLED'}")
     print(f"Prompt type: {args.prompt_type}")
+    print(f"Centroid method: {args.centroid_method}")
     print(f"Beta values: {beta_values}")
     print(f"Total runs: {len(beta_values)}")
     print(f"Max workers: {args.max_workers if args.max_workers else 'CPU count'}")
@@ -270,7 +273,7 @@ def main():
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Submit all jobs
             future_to_beta = {
-                executor.submit(run_single_beta, beta, args.mode, args.test, args.cluster, args.prompt_type): beta 
+                executor.submit(run_single_beta, beta, args.mode, args.test, args.cluster, args.prompt_type, args.centroid_method): beta 
                 for beta in beta_values
             }
             
@@ -335,10 +338,11 @@ def main():
     output_files = []
     for beta in beta_values:
         output_filename = f"memgpt_hypotheses_{args.prompt_type}_{args.mode}"
-        if args.mode == "hybrid" and beta != 0.5:
+        if args.mode == "hybrid":
             output_filename += f"_beta{beta}"
         if args.cluster:
             output_filename += "_cluster"
+        output_filename += f"_{args.centroid_method}"
         filename = f"{output_filename}.jsonl"
         
         if args.test:

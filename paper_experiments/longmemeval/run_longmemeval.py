@@ -94,13 +94,13 @@ def load_and_filter_data() -> list[dict]:
         print("CRITICAL WARNING: No test cases were loaded after filtering. Please check data files and question types.")
     return filtered_data
 
-def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: str = "focus", beta: float = 0.5, cluster_summaries: bool = False, prompt_type: str = "memgpt_default") -> str:
+def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: str = "focus", beta: float = 0.5, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid", score_mode: str = None) -> str:
     """
     Directly instantiates and controls a MemGPT Agent to run a test case.
     """
     q_id = test_case['question_id']
     agent_name = f"longmemeval_agent_{q_id}"
-    log_debug(f"--- Starting Test Instance: {q_id} (Memory Mode: {memory_mode}, Beta: {beta}, Clustering: {'ON' if cluster_summaries else 'OFF'}, Prompt Type: {prompt_type}) ---")
+    log_debug(f"--- Starting Test Instance: {q_id} (Memory Mode: {memory_mode}, Beta: {beta}, Clustering: {'ON' if cluster_summaries else 'OFF'}, Prompt Type: {prompt_type}, Centroid Method: {centroid_method}, Score Mode: {score_mode or 'None'}) ---")
     
     # 1. Direct Agent Creation (in-memory)
     dummy_user_id = uuid.uuid4()
@@ -128,12 +128,14 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
             "beta": beta,  # Explicitly set beta parameter
             "cluster_summaries": cluster_summaries,  # Explicitly set clustering parameter
             "prompt_type": prompt_type,  # Explicitly set prompt type
+            "centroid_method": centroid_method,  # Explicitly set centroid method
+            "score_mode": score_mode,  # Explicitly set score mode
         },
     )
 
     try:
-        agent = Agent(interface=SilentInterface(), agent_state=agent_state, mem_mode=memory_mode, beta=beta, cluster_summaries=cluster_summaries)
-        log_debug(f"Successfully created agent '{agent.agent_state.name}' with memory mode: {memory_mode}, beta: {beta}, clustering: {'ON' if cluster_summaries else 'OFF'}, prompt_type: {prompt_type}")
+        agent = Agent(interface=SilentInterface(), agent_state=agent_state, mem_mode=memory_mode, beta=beta, cluster_summaries=cluster_summaries, centroid_method=centroid_method, score_mode=score_mode)
+        log_debug(f"Successfully created agent '{agent.agent_state.name}' with memory mode: {memory_mode}, beta: {beta}, clustering: {'ON' if cluster_summaries else 'OFF'}, prompt_type: {prompt_type}, centroid_method: {centroid_method}, score_mode: {score_mode or 'None'}")
     except Exception as e:
         log_debug(f"FATAL ERROR in instance {q_id}: Could not instantiate Agent object. Error: {e}")
         traceback.print_exc()
@@ -163,12 +165,13 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
         
         try:
             if memory_mode == "focus":
-                # Force focus mode summarization
+                # Force focus summarization
                 print("=" * 70)
-                print("  ||  MANUAL FOCUS MODE SUMMARIZATION TRIGGERED  ||")
+                mode_name = "INVERTED FOCUS MODE" if score_mode == "inverted_focus" else "FOCUS MODE"
+                print(f"  ||  MANUAL {mode_name} SUMMARIZATION TRIGGERED  ||")
                 print("=" * 70)
                 
-                from memgpt.embeddings import calculate_centroid, calculate_cosine_distances
+                from memgpt.embeddings import calculate_centroid, calculate_medoid, calculate_cosine_distances
                 import numpy as np
                 
                 # Generate embeddings for focus mode using our custom function
@@ -200,9 +203,12 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
                     log_debug(f"Found {user_assistant_pairs} user-assistant pairs manually")
                 
                 if message_pair_embeddings_with_ids:
-                    # Calculate centroid and distances
+                    # Calculate centroid/medoid and distances
                     actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
-                    centroid_vec = calculate_centroid(actual_embedding_vectors)
+                    if centroid_method == "medoid":
+                        centroid_vec = calculate_medoid(actual_embedding_vectors)
+                    else:
+                        centroid_vec = calculate_centroid(actual_embedding_vectors)
                     
                     if centroid_vec is not None:
                         np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
@@ -217,14 +223,17 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
                                 "distance": distances[i]
                             })
                         
-                        sorted_messages_by_distance = sorted(messages_with_distances, key=lambda x: x["distance"], reverse=True)
-                        log_debug(f"Sorted {len(sorted_messages_by_distance)} message pairs by distance.")
+                        # Sort by distance (normal focus: furthest first, inverted focus: closest first)
+                        reverse_sort = False if score_mode == "inverted_focus" else True
+                        sorted_messages_by_distance = sorted(messages_with_distances, key=lambda x: x["distance"], reverse=reverse_sort)
+                        sort_desc = "closest first" if score_mode == "inverted_focus" else "furthest first"
+                        log_debug(f"Sorted {len(sorted_messages_by_distance)} message pairs by distance ({sort_desc}).")
                         
                         # Trigger focus summarization
                         agent.summarize_messages_focus_inplace(sorted_messages_by_distance)
-                        log_debug("Focus mode summarization completed successfully.")
+                        log_debug(f"{mode_name} summarization completed successfully.")
                     else:
-                        log_debug("Centroid calculation failed, falling back to FIFO.")
+                        log_debug(f"{centroid_method.capitalize()} calculation failed, falling back to FIFO.")
                         agent.summarize_messages_inplace()
                 else:
                     log_debug("No embeddings generated, falling back to FIFO.")
@@ -410,6 +419,36 @@ def main():
         except (ValueError, IndexError):
             print("Error parsing --prompt-type flag. Defaulting to 'memgpt_default'.")
 
+    centroid_method = "centroid"  # Default centroid method
+    if "--centroid-method" in args:
+        try:
+            centroid_method_index = args.index("--centroid-method") + 1
+            if centroid_method_index < len(args):
+                specified_centroid_method = args[centroid_method_index]
+                if specified_centroid_method in ["centroid", "medoid"]:
+                    centroid_method = specified_centroid_method
+                else:
+                    print(f"Warning: Invalid centroid method '{specified_centroid_method}'. Defaulting to 'centroid'.")
+            else:
+                print("Warning: --centroid-method flag used without a value. Defaulting to 'centroid'.")
+        except (ValueError, IndexError):
+            print("Error parsing --centroid-method flag. Defaulting to 'centroid'.")
+
+    score_mode = None  # Default score mode
+    if "--score-mode" in args:
+        try:
+            score_mode_index = args.index("--score-mode") + 1
+            if score_mode_index < len(args):
+                specified_score_mode = args[score_mode_index]
+                if specified_score_mode in ["inverted_focus"]:
+                    score_mode = specified_score_mode
+                else:
+                    print(f"Warning: Invalid score mode '{specified_score_mode}'. Defaulting to None.")
+            else:
+                print("Warning: --score-mode flag used without a value. Defaulting to None.")
+        except (ValueError, IndexError):
+            print("Error parsing --score-mode flag. Defaulting to None.")
+
     if test_mode:
         print("RUNNING IN TEST MODE - Will process only first 3 cases with verbose output")
     print(f"Using memory mode: {memory_mode.upper()}")
@@ -419,14 +458,19 @@ def main():
         print(f"Beta parameter: {beta} (only used in hybrid mode)")
     print(f"Clustering-based summarization: {'ENABLED' if cluster_summaries else 'DISABLED'}")
     print(f"Prompt type: {prompt_type}")
+    print(f"Centroid method: {centroid_method.upper()}")
+    print(f"Score mode: {score_mode.upper() if score_mode else 'NONE'}")
     
-    # Create output path based on mode, beta, clustering, and prompt type
+    # Create output path based on mode, beta, clustering, centroid method, score mode, and prompt type
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"memgpt_hypotheses_{prompt_type}_{memory_mode}"
-    if memory_mode == "hybrid" and beta != 0.5:
+    if memory_mode == "hybrid":
         output_filename += f"_beta{beta}"
     if cluster_summaries:
         output_filename += "_cluster"
+    output_filename += f"_{centroid_method}"
+    if score_mode:
+        output_filename += f"_{score_mode}"
     if test_mode:
         output_filename += "_test"
     output_filename += f"_{timestamp}"
@@ -439,7 +483,7 @@ def main():
     
     # In test mode, only run first 3 cases
     if test_mode:
-        test_cases = test_cases[0:25]
+        test_cases = test_cases[8:15]
         print(f"Test mode: Limited to {len(test_cases)} cases")
     
     # --- RESUME LOGIC ---
@@ -467,7 +511,7 @@ def main():
         print(f"\nStarting {'test' if test_mode else 'benchmark'} run on {len(remaining_test_cases)} {'test' if test_mode else 'filtered'} cases.")
     
     # Use different output file for test mode
-    final_output_path = output_path + ".test" if test_mode else output_path
+    final_output_path = output_path #+ ".test" if test_mode else output_path
     
     # --- GRACEFUL INTERRUPT & APPEND LOGIC ---
     with open(final_output_path, 'w' if test_mode else 'a', encoding='utf-8') as outfile:
@@ -482,7 +526,7 @@ def main():
                     print(f"TOTAL TURNS: {total_turns}")
                     print(f"{'='*50}")
                 
-                hypothesis = run_test_instance(config, case, memory_mode=memory_mode, beta=beta, cluster_summaries=cluster_summaries, prompt_type=prompt_type)
+                hypothesis = run_test_instance(config, case, memory_mode=memory_mode, beta=beta, cluster_summaries=cluster_summaries, prompt_type=prompt_type, centroid_method=centroid_method, score_mode=score_mode)
                 
                 result = {
                     "question_id": case['question_id'],

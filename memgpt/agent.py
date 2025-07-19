@@ -48,7 +48,7 @@ from memgpt.constants import (
 )
 from .errors import LLMError
 from .functions.functions import USER_FUNCTIONS_DIR, load_all_function_sets
-from memgpt.embeddings import create_embedding, calculate_centroid, calculate_cosine_distances
+from memgpt.embeddings import create_embedding, calculate_centroid, calculate_medoid, calculate_cosine_distances
 
 
 def link_functions(function_schemas: list):
@@ -193,6 +193,8 @@ class Agent(object):
         mem_mode: Optional[str] = "hybrid",  # new memory mode parameter
         beta: Optional[float] = 0.5,  # new beta parameter for hybrid mode (0-1)
         cluster_summaries: Optional[bool] = False,  # new clustering parameter
+        centroid_method: Optional[str] = "centroid",  # new parameter to switch between centroid and medoid
+        score_mode: Optional[str] = None,  # new parameter to modify scoring (e.g. "inverted_focus")
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
@@ -200,6 +202,14 @@ class Agent(object):
         # Validate beta parameter
         if beta is not None and (beta < 0.0 or beta > 1.0):
             raise ValueError(f"Beta parameter must be between 0.0 and 1.0, got {beta}")
+        
+        # Validate centroid_method parameter
+        if centroid_method is not None and centroid_method not in ["centroid", "medoid"]:
+            raise ValueError(f"Centroid method must be 'centroid' or 'medoid', got {centroid_method}")
+        
+        # Validate score_mode parameter
+        if score_mode is not None and score_mode not in ["inverted_focus"]:
+            raise ValueError(f"Score mode must be 'inverted_focus' or None, got {score_mode}")
         
         # An agent can be created from a Preset object
         if preset is not None:
@@ -226,11 +236,15 @@ class Agent(object):
                     "mem_mode": mem_mode if mem_mode is not None else "focus", # Store mem_mode from preset creation
                     "beta": beta if beta is not None else 0.5, # Store beta from preset creation
                     "cluster_summaries": cluster_summaries if cluster_summaries is not None else False, # Store cluster_summaries from preset creation
+                    "centroid_method": centroid_method if centroid_method is not None else "centroid", # Store centroid_method from preset creation
+                    "score_mode": score_mode, # Store score_mode from preset creation
                 },
             )
             self.mem_mode = mem_mode if mem_mode is not None else "focus"
             self.beta = beta if beta is not None else 0.5
             self.cluster_summaries = cluster_summaries if cluster_summaries is not None else False
+            self.centroid_method = centroid_method if centroid_method is not None else "centroid"
+            self.score_mode = score_mode  # Store score_mode
             self.prompt_type = "memgpt_default"  # Default prompt type for preset-based agents
 
         # An agent can also be created directly from AgentState
@@ -243,6 +257,8 @@ class Agent(object):
             self.mem_mode = agent_state.state.get("mem_mode", "fifo") # Load mem_mode from state
             self.beta = agent_state.state.get("beta", 0.5) # Load beta from state
             self.cluster_summaries = agent_state.state.get("cluster_summaries", False) # Load cluster_summaries from state
+            self.centroid_method = agent_state.state.get("centroid_method", "centroid") # Load centroid_method from state
+            self.score_mode = agent_state.state.get("score_mode", None) # Load score_mode from state
             self.prompt_type = agent_state.state.get("prompt_type", "memgpt_default") # Load prompt_type from state
 
         else:
@@ -859,7 +875,8 @@ class Agent(object):
                     return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
                 elif self.mem_mode == "focus":
                     print("=" * 70)
-                    print("  ||  CONTEXT OVERFLOW - FOCUS MODE ACTIVATED - PRE-SUMMARY DIAGNOSTICS  ||")
+                    mode_name = "INVERTED FOCUS MODE" if self.score_mode == "inverted_focus" else "FOCUS MODE"
+                    print(f"  ||  CONTEXT OVERFLOW - {mode_name} ACTIVATED - PRE-SUMMARY DIAGNOSTICS  ||")
                     print("=" * 70)
                     
                     original_user_message_text = user_message.text if isinstance(user_message, Message) else str(user_message)
@@ -891,15 +908,19 @@ class Agent(object):
                             print("No message pair embeddings generated. Defaulting to FIFO summarization or error.")
                             raise e 
 
-                        # Extract just the embedding vectors for centroid and distance calculation
+                        # Extract just the embedding vectors for centroid/medoid and distance calculation
                         actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
 
-                        # Calculate centroid
-                        centroid_vec = calculate_centroid(actual_embedding_vectors)
-                        print('Centroid vector calculated successfully.')
+                        # Calculate centroid or medoid based on the configured method
+                        if self.centroid_method == "medoid":
+                            centroid_vec = calculate_medoid(actual_embedding_vectors)
+                            print('Medoid vector calculated successfully.')
+                        else:
+                            centroid_vec = calculate_centroid(actual_embedding_vectors)
+                            print('Centroid vector calculated successfully.')
 
                         if centroid_vec is None:
-                            print("Centroid calculation failed (no vectors or other issue). Defaulting to FIFO or error.")
+                            print(f"{self.centroid_method.capitalize()} calculation failed (no vectors or other issue). Defaulting to FIFO or error.")
                             raise e
                         
                         # Convert list of list to list of np.array for distance calculation
@@ -917,10 +938,12 @@ class Agent(object):
                                 "distance": distances[i]
                             })
                         
-                        # Sort by distance, descending (furthest first)
-                        sorted_messages_by_distance = sorted(messages_with_distances, key=lambda x: x["distance"], reverse=True)
+                        # Sort by distance (normal focus: furthest first, inverted focus: closest first)
+                        reverse_sort = False if self.score_mode == "inverted_focus" else True
+                        sorted_messages_by_distance = sorted(messages_with_distances, key=lambda x: x["distance"], reverse=reverse_sort)
                         
-                        print(f"Message pairs sorted by distance from centroid (furthest first):")
+                        sort_desc = "closest first" if self.score_mode == "inverted_focus" else "furthest first"
+                        print(f"Message pairs sorted by distance from centroid ({sort_desc}):")
                         for item in sorted_messages_by_distance:
                             print(f"  User_ID: {item['user_msg_id']}, Asst_ID: {item['assistant_msg_id']}, Distance: {item['distance']:.4f}")
 
@@ -929,7 +952,7 @@ class Agent(object):
                             self.summarize_messages_focus_inplace(sorted_messages_by_distance)
                             
                             print("-" * 70)
-                            print("  ||  FOCUS MODE - POST-SUMMARY DIAGNOSTICS (BEFORE RETRY)  ||")
+                            print(f"  ||  {mode_name} - POST-SUMMARY DIAGNOSTICS (BEFORE RETRY)  ||")
                             print("-" * 70)
                             
                             user_message_for_retry_text = user_message.text if isinstance(user_message, Message) else str(user_message)
@@ -951,7 +974,7 @@ class Agent(object):
                             print(f"Focus Post-Summary: LLM context window: {self.agent_state.llm_config.context_window}")
                             
                             # Try step again
-                            print("Focus mode: Summarization complete, retrying step.")
+                            print(f"{mode_name}: Summarization complete, retrying step.")
                             return self.step(user_message, first_message=first_message, return_dicts=return_dicts, recreate_message_timestamp=recreate_message_timestamp)
                         except LLMError as focus_sum_e: # Catch specific error from our focus summarizer
                             print(f"{CLI_WARNING_PREFIX}Focus mode summarization failed: {focus_sum_e}. Re-raising original overflow error to halt.")
@@ -1022,6 +1045,7 @@ class Agent(object):
                     except Exception as general_sum_e: # Catch any other unexpected error during summarization
                         print(f"{CLI_WARNING_PREFIX}Unexpected error during hybrid mode summarization: {general_sum_e}. Re-raising original overflow error to halt.")
                         raise e # Re-raise the original overflow error
+
                 else:
                     # Default to FIFO if mode is unrecognized
                     print(f"Context overflow in unrecognized mem_mode '{self.mem_mode}', defaulting to FIFO summarization.")
@@ -1381,13 +1405,17 @@ class Agent(object):
             self.summarize_messages_inplace()
             return
 
-        # Extract just the embedding vectors for centroid and distance calculation
+        # Extract just the embedding vectors for centroid/medoid and distance calculation
         actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
 
-        # Calculate centroid
-        centroid_vec = calculate_centroid(actual_embedding_vectors)
+        # Calculate centroid or medoid based on the configured method
+        if self.centroid_method == "medoid":
+            centroid_vec = calculate_medoid(actual_embedding_vectors)
+        else:
+            centroid_vec = calculate_centroid(actual_embedding_vectors)
+        
         if centroid_vec is None:
-            print("Hybrid summarize: Centroid calculation failed. Falling back to pure FIFO mode.")
+            print(f"Hybrid summarize: {self.centroid_method.capitalize()} calculation failed. Falling back to pure FIFO mode.")
             self.summarize_messages_inplace()
             return
 
@@ -1405,17 +1433,32 @@ class Agent(object):
             normalized_distance = distances[i] / max_distance if max_distance > 0 else 0.0
             pair_focus_scores[(user_msg_id, assistant_msg_id)] = normalized_distance
 
-        # Step 3: Create FIFO scores (chronological order, for pairs)
+        # Step 3: Create FIFO scores (chronological order, for pairs) - FIXED VERSION
         pair_fifo_scores = {}
-        total_pairs = len(message_pair_embeddings_with_ids)
+        
+        # Create mapping from message ID to actual position in conversation
+        message_id_to_position = {msg.id: idx for idx, msg in enumerate(self._messages)}
+        max_position = len(self._messages) - 1
         
         # Create FIFO scores where older pairs get higher scores (more likely to be removed)
-        for i, pair_data in enumerate(message_pair_embeddings_with_ids):
-            user_msg_id = pair_data[0]
-            assistant_msg_id = pair_data[1]
-            # Higher scores for older pairs (earlier in history)
-            fifo_score = (total_pairs - i) / total_pairs if total_pairs > 0 else 0.0
-            pair_fifo_scores[(user_msg_id, assistant_msg_id)] = max(0.0, fifo_score)
+        for user_msg_id, assistant_msg_id, _ in message_pair_embeddings_with_ids:
+            # Get actual positions in the conversation
+            user_pos = message_id_to_position.get(user_msg_id, 0)
+            asst_pos = message_id_to_position.get(assistant_msg_id, 0)
+            
+            # Use average position of the pair
+            avg_position = (user_pos + asst_pos) / 2.0
+            
+            # Normalize: older messages (lower position) get higher scores for removal
+            if max_position > 0:
+                fifo_score = (max_position - avg_position) / max_position
+            else:
+                fifo_score = 0.0
+            
+            # Ensure score is between 0 and 1
+            fifo_score = max(0.0, min(1.0, fifo_score))
+            
+            pair_fifo_scores[(user_msg_id, assistant_msg_id)] = fifo_score
 
         # Step 4: Combine scores using beta weighting
         pair_hybrid_scores = {}
@@ -1493,6 +1536,31 @@ class Agent(object):
 
         if not actual_messages_for_summarizer_chronological:
             raise LLMError("Hybrid summarize: Messages were marked for removal, but could not be collected for the summarizer.")
+
+        # Print focus and FIFO scores for selected message pairs before summarization
+        print("=" * 50)
+        print("HYBRID MODE SCORE ANALYSIS - Selected Pairs for Summarization")
+        print("=" * 50)
+        
+        # Collect scores for the selected message pairs using the ACTUAL scores that were used for selection
+        selected_focus_scores = []
+        selected_fifo_scores = []
+        selected_hybrid_scores = []
+        
+        # Group message IDs back into pairs for score lookup using ORIGINAL hybrid scores
+        for (user_msg_id, assistant_msg_id), original_hybrid_score in pair_hybrid_scores.items():
+            if user_msg_id in message_ids_to_remove_set and assistant_msg_id in message_ids_to_remove_set:
+                focus_score = pair_focus_scores.get((user_msg_id, assistant_msg_id), 0.0)
+                fifo_score = pair_fifo_scores.get((user_msg_id, assistant_msg_id), 0.0)
+                selected_focus_scores.append(focus_score)
+                selected_fifo_scores.append(fifo_score)
+                selected_hybrid_scores.append(original_hybrid_score)
+                print(f"  Pair (User: {user_msg_id}, Asst: {assistant_msg_id}): Focus={focus_score:.4f}, FIFO={fifo_score:.4f}, Hybrid={original_hybrid_score:.4f}")
+        
+        print(f"\nHybrid Score Formula Used: Focus * {self.beta} + FIFO * {1.0 - self.beta}")
+        if selected_hybrid_scores:
+            print(f"Original hybrid scores range: {min(selected_hybrid_scores):.4f} to {max(selected_hybrid_scores):.4f}")
+        print("=" * 50)
 
         # Step 7: Generate summary
         print(f"Hybrid summarize: Summarizing {len(actual_messages_for_summarizer_chronological)} messages from {len(message_ids_to_remove_set)//2} pairs.")

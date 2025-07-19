@@ -12,12 +12,12 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Tuple
 
-def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False, cluster_summaries: bool = False, prompt_type: str = "memgpt_default") -> Tuple[float, int, str]:
+def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid") -> Tuple[float, int, str]:
     """Run a single beta value using the original script."""
     script_path = os.path.join(os.path.dirname(__file__), "run_longmemeval.py")
     
     # Build command
-    cmd = [sys.executable, script_path, "--mode", memory_mode, "--beta", str(beta), "--prompt-type", prompt_type]
+    cmd = [sys.executable, script_path, "--mode", memory_mode, "--beta", str(beta), "--prompt-type", prompt_type, "--centroid-method", centroid_method]
     if test_mode:
         cmd.append("--test")
     if cluster_summaries:
@@ -42,7 +42,7 @@ def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = 
         print(f"[BATCH] ✗ Beta={beta} exception: {e}")
         return beta, -2, str(e)
 
-def run_beta_batch(beta_batch: List[float], memory_mode: str, test_mode: bool, cluster_summaries: bool = False, prompt_type: str = "memgpt_default") -> List[Tuple[float, int, str]]:
+def run_beta_batch(beta_batch: List[float], memory_mode: str, test_mode: bool, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid") -> List[Tuple[float, int, str]]:
     """Run a batch of beta values in parallel."""
     print(f"\n{'='*60}")
     print(f"RUNNING BATCH: {beta_batch}")
@@ -53,7 +53,7 @@ def run_beta_batch(beta_batch: List[float], memory_mode: str, test_mode: bool, c
     
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_beta = {
-            executor.submit(run_single_beta, beta, memory_mode, test_mode, cluster_summaries, prompt_type): beta 
+            executor.submit(run_single_beta, beta, memory_mode, test_mode, cluster_summaries, prompt_type, centroid_method): beta 
             for beta in beta_batch
         }
         
@@ -87,6 +87,8 @@ def main():
                        help="Enable clustering-based summarization (default: disabled)")
     parser.add_argument("--prompt-type", choices=["memgpt_default", "xml"], default="memgpt_default",
                        help="Prompt type to use (default: memgpt_default)")
+    parser.add_argument("--centroid-method", choices=["centroid", "medoid"], default="centroid",
+                       help="Method to use for calculating representative vector (default: centroid)")
     
     args = parser.parse_args()
     
@@ -110,6 +112,7 @@ def main():
     print(f"Test mode: {'ON' if args.test else 'OFF'}")
     print(f"Clustering-based summarization: {'ENABLED' if args.cluster else 'DISABLED'}")
     print(f"Prompt type: {args.prompt_type}")
+    print(f"Centroid method: {args.centroid_method}")
     print(f"Beta values: {beta_values}")
     print(f"Batch size: {args.batch_size}")
     print(f"Number of batches: {len(batches)}")
@@ -123,7 +126,7 @@ def main():
     # Run each batch sequentially
     for batch_num, beta_batch in enumerate(batches, 1):
         print(f"\n🚀 Starting Batch {batch_num}/{len(batches)}")
-        batch_results = run_beta_batch(beta_batch, args.mode, args.test, args.cluster, args.prompt_type)
+        batch_results = run_beta_batch(beta_batch, args.mode, args.test, args.cluster, args.prompt_type, args.centroid_method)
         all_results.extend(batch_results)
         
         # Update counters
@@ -166,6 +169,7 @@ def main():
             output_filename += f"_beta{beta}"
         if args.cluster:
             output_filename += "_cluster"
+        output_filename += f"_{args.centroid_method}"
         filename = f"{output_filename}.jsonl"
         
         if args.test:

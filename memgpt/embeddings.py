@@ -338,6 +338,70 @@ def calculate_centroid(embedding_vectors: List[List[float]]) -> Optional[np.ndar
     return centroid
 
 
+def calculate_medoid(embedding_vectors: List[List[float]]) -> Optional[np.ndarray]:
+    """
+    Calculates the medoid of a list of embedding vectors.
+    The medoid is the vector in the dataset that minimizes the sum of cosine distances to all other vectors.
+
+    Args:
+        embedding_vectors: A list of embedding vectors (list of lists of floats).
+
+    Returns:
+        A numpy array representing the medoid (one of the original vectors), or None if the input is empty.
+    """
+    if not embedding_vectors:
+        return None
+    
+    if len(embedding_vectors) == 1:
+        print("Only one vector available, returning it as medoid")
+        return np.array(embedding_vectors[0])
+    
+    # Convert list of lists to a 2D numpy array
+    vectors_array = np.array(embedding_vectors)
+    n_vectors = len(embedding_vectors)
+    
+    # Calculate pairwise cosine distances
+    min_total_distance = float('inf')
+    medoid_idx = 0
+    
+    for i in range(n_vectors):
+        total_distance = 0.0
+        current_vector = vectors_array[i]
+        
+        # Normalize current vector
+        norm_current = np.linalg.norm(current_vector)
+        if norm_current == 0:
+            continue  # Skip zero vectors
+        normalized_current = current_vector / norm_current
+        
+        # Calculate distance from current vector to all other vectors
+        for j in range(n_vectors):
+            if i != j:
+                other_vector = vectors_array[j]
+                norm_other = np.linalg.norm(other_vector)
+                if norm_other == 0:
+                    total_distance += 1.0  # Max distance for zero vector
+                    continue
+                
+                normalized_other = other_vector / norm_other
+                
+                # Cosine similarity
+                similarity = np.dot(normalized_current, normalized_other)
+                
+                # Cosine distance
+                distance = 1 - similarity
+                total_distance += distance
+        
+        # Update medoid if this vector has lower total distance
+        if total_distance < min_total_distance:
+            min_total_distance = total_distance
+            medoid_idx = i
+    
+    medoid = vectors_array[medoid_idx]
+    print(f"Successfully calculated medoid (vector {medoid_idx} with total distance {min_total_distance:.4f})")
+    return medoid
+
+
 def calculate_cosine_distances(target_vector: np.ndarray, embedding_vectors: List[np.ndarray]) -> List[float]:
     """
     Calculates the cosine distance of each vector in a list from a target vector.
