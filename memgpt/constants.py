@@ -8,11 +8,14 @@ TOOL_CALL_ID_MAX_LEN = 29
 
 # embeddings
 MAX_EMBEDDING_DIM = 4096  # maximum supported embeding size - do NOT change or else DBs will need to be reset
-DEFAULT_EMBEDDING_MODEL = "text-embedding-ada-002"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
+DEFAULT_EMBEDDING_DIM = 3072  # default dimension for text-embedding-3-large
 
-# tokenizers
+# Tokenizer map
 EMBEDDING_TO_TOKENIZER_MAP = {
     "text-embedding-ada-002": "cl100k_base",
+    "text-embedding-3-large": "cl100k_base",
+    "text-embedding-3-small": "cl100k_base",
 }
 EMBEDDING_TO_TOKENIZER_DEFAULT = "cl100k_base"
 
@@ -57,6 +60,8 @@ LLM_MAX_TOKENS = {
     "DEFAULT": 8192,
     ## OpenAI models: https://platform.openai.com/docs/models/overview
     #
+    "gpt-4.1-mini": 128000,
+
     "gpt-4o-mini": 128000,
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o-2024-08-06-mini": 128000,
