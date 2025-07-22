@@ -165,6 +165,7 @@ def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None
 
         additional_kwargs = {"user_id": user_id} if user_id else {}
         model = OpenAIEmbedding(
+            model=config.embedding_model,
             api_base=config.embedding_endpoint,
             api_key=credentials.openai_key,
             additional_kwargs=additional_kwargs,
@@ -182,7 +183,7 @@ def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None
         from llama_index.embeddings.azure_openai import AzureOpenAIEmbedding
 
         # https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#embeddings
-        model = "text-embedding-ada-002"
+        model = "text-embedding-3-large"
         deployment = credentials.azure_embedding_deployment if credentials.azure_embedding_deployment is not None else model
         return AzureOpenAIEmbedding(
             model=model,

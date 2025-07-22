@@ -460,8 +460,8 @@ def configure_embedding_endpoint(config: MemGPTConfig, credentials: MemGPTCreden
 
         embedding_endpoint_type = "openai"
         embedding_endpoint = "https://api.openai.com/v1"
-        embedding_dim = 1536
-        embedding_model = "text-embedding-ada-002"
+        embedding_dim = 3072
+        embedding_model = "text-embedding-3-large"
 
     elif embedding_provider == "azure":
         # check for necessary vars
@@ -474,11 +474,10 @@ def configure_embedding_endpoint(config: MemGPTConfig, credentials: MemGPTCreden
         credentials.azure_version = azure_creds["azure_version"]
         credentials.azure_embedding_endpoint = azure_creds["azure_embedding_endpoint"]
         credentials.save()
-
         embedding_endpoint_type = "azure"
         embedding_endpoint = azure_creds["azure_embedding_endpoint"]
-        embedding_dim = 1536
-        embedding_model = "text-embedding-ada-002"
+        embedding_dim = 3072
+        embedding_model = "text-embedding-3-large"
 
     elif embedding_provider == "hugging-face":
         # configure hugging face embedding endpoint (https://github.com/huggingface/text-embeddings-inference)
@@ -508,8 +507,8 @@ def configure_embedding_endpoint(config: MemGPTConfig, credentials: MemGPTCreden
             raise KeyboardInterrupt
 
         # get model dimentions
-        default_embedding_dim = config.default_embedding_config.embedding_dim if config.default_embedding_config.embedding_dim else "1024"
-        embedding_dim = questionary.text("Enter embedding model dimentions (e.g. 1024):", default=str(default_embedding_dim)).ask()
+        default_embedding_dim = config.default_embedding_config.embedding_dim if config.default_embedding_config.embedding_dim else "3072"
+        embedding_dim = questionary.text("Enter embedding model dimentions (e.g. 3072):", default=str(default_embedding_dim)).ask()
         if embedding_dim is None:
             raise KeyboardInterrupt
         try:
