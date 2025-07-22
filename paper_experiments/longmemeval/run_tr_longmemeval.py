@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Parallelized version of run_longmemeval.py that can run multiple test cases simultaneously.
-This script supports configurable batch sizes and works in both test and normal modes.
+Parallel test case runner for LongMemEval benchmark - TEMPORAL REASONING ONLY.
+This script runs only test cases with question_type "temporal-reasoning".
+Works in both test and normal modes with configurable batch sizes.
 """
 
 import json
@@ -36,61 +37,55 @@ from memgpt.utils import get_persona_text, get_human_text, count_tokens
 from memgpt.prompts import gpt_system
 from memgpt.presets.presets import generate_functions_json
 
-# A dummy interface to suppress the agent's internal terminal output during the run
+# Silent interface to suppress output during parallel processing
 class SilentInterface(AgentInterface):
     def user_message(self, msg, msg_obj=None) -> None: 
-        # Show user messages if they contain memory warnings or heartbeats
-        if msg and ("memory" in msg.lower() or "heartbeat" in msg.lower() or "summary" in msg.lower()):
-            pass  # Suppress even memory messages in parallel mode to avoid output clutter
+        pass  # Suppress all output in parallel mode
     
     def internal_monologue(self, msg, msg_obj=None) -> None: 
-        pass  # Suppress all internal monologue in parallel mode
+        pass  # Suppress all output in parallel mode
     
     def assistant_message(self, msg, msg_obj=None) -> None: 
-        pass  # Suppress all assistant messages in parallel mode
+        pass  # Suppress all output in parallel mode
     
     def function_message(self, msg, msg_obj=None) -> None: 
-        pass  # Suppress all function messages in parallel mode
+        pass  # Suppress all output in parallel mode
 
 # --- Constants ---
 MODULE_BASE_PATH = os.path.dirname(__file__)
 DATA_PATH = os.path.join(MODULE_BASE_PATH, "data", "longmemeval_s.json")
 ORACLE_PATH = os.path.join(MODULE_BASE_PATH, "data", "longmemeval_oracle.json")
 
-FOCUSED_QUESTION_TYPES = {
-    "single-session-user",
-    "single-session-assistant", 
-    "single-session-preference",
-    "multi-session"
+# Only temporal reasoning question types
+TEMPORAL_REASONING_QUESTION_TYPES = {
+    "temporal-reasoning"
 }
 
 # Global file locks for thread-safe writing
 output_lock = Lock()
-scoring_lock = Lock()
 
 def load_and_filter_data() -> list[dict]:
-    """Loads and filters LongMemEval data for the focused question types."""
-    log_debug("Executing load_and_filter_data...")
-    log_debug(f"Loading main data from: {DATA_PATH}")
+    """Loads and filters LongMemEval data for temporal reasoning question types only."""
+    log_debug("Loading and filtering data for temporal reasoning...")
+    
     with open(DATA_PATH, 'r', encoding='utf-8') as f:
         full_data = json.load(f)
 
-    log_debug(f"Loading oracle data from: {ORACLE_PATH}")
     with open(ORACLE_PATH, 'r', encoding='utf-8') as f:
         oracle_list = json.load(f)
     
     oracle_data = {item['question_id']: item for item in oracle_list}
-    log_debug(f"Oracle data contains {len(oracle_data)} question entries.")
     
     filtered_data = [
         item for item in full_data
-        if oracle_data.get(item['question_id'], {}).get('question_type') in FOCUSED_QUESTION_TYPES
+        if oracle_data.get(item['question_id'], {}).get('question_type') in TEMPORAL_REASONING_QUESTION_TYPES
     ]
     
-    log_debug(f"Original data size: {len(full_data)} cases.")
-    log_debug(f"Filtered to {len(filtered_data)} cases for types: {', '.join(FOCUSED_QUESTION_TYPES)}")
+    log_debug(f"Loaded {len(filtered_data)} temporal reasoning test cases (filtered from {len(full_data)} total)")
+    
     if not filtered_data:
-        print("CRITICAL WARNING: No test cases were loaded after filtering. Please check data files and question types.")
+        print("CRITICAL WARNING: No temporal reasoning test cases were loaded after filtering!")
+    
     return filtered_data
 
 def run_single_test_case(args_tuple):
@@ -107,7 +102,7 @@ def run_single_test_case(args_tuple):
         # Recreate config object from dict (needed for multiprocessing)
         config = MemGPTConfig(**config_dict)
         
-        # Run the test instance using the same logic as the original script
+        # Run the test instance
         hypothesis = run_test_instance_worker(
             config, test_case, memory_mode, beta, cluster_summaries,
             prompt_type, centroid_method, score_mode, worker_id
@@ -122,15 +117,12 @@ def run_single_test_case(args_tuple):
         return {
             "success": True,
             "result": result,
-            "scoring_analysis": None,  # Can be extended later
             "worker_id": worker_id,
             "question_id": q_id
         }
         
     except Exception as e:
         error_msg = f"ERROR in worker {worker_id} for case {q_id}: {str(e)}"
-        print(f"[WORKER {worker_id}] {error_msg}")
-        traceback.print_exc()
         
         return {
             "success": False,
@@ -139,7 +131,6 @@ def run_single_test_case(args_tuple):
                 "hypothesis": f"ERROR: {error_msg}",
                 "ground_truth": test_case.get('answer', 'N/A')
             },
-            "scoring_analysis": None,
             "worker_id": worker_id,
             "question_id": q_id,
             "error": error_msg
@@ -151,12 +142,12 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
                            score_mode: str = None, worker_id: int = 0) -> str:
     """
     Worker version of run_test_instance that runs in a separate process.
-    Simplified to focus on getting hypothesis without debug output.
+    Streamlined for parallel execution.
     """
     q_id = test_case['question_id']
-    agent_name = f"longmemeval_agent_{q_id}_worker_{worker_id}"
+    agent_name = f"tr_longmemeval_agent_{q_id}_w{worker_id}"
     
-    # 1. Direct Agent Creation (in-memory)
+    # 1. Create Agent
     dummy_user_id = uuid.uuid4()
     preset_config = available_presets[DEFAULT_PRESET]
     preset_system_prompt = preset_config["system_prompt"]
@@ -199,11 +190,11 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
     except Exception as e:
         return f"ERROR: AGENT_INSTANTIATION_FAILED FOR {q_id}: {e}"
     
-    # 2. Manual History Construction
+    # 2. Inject conversation history
     full_chat_history = [turn for session in test_case['haystack_sessions'] for turn in session]
     agent.append_to_messages(full_chat_history)
 
-    # 3. Context overflow check and force summarization if needed
+    # 3. Check for context overflow and trigger summarization if needed
     current_tokens = sum(count_tokens(str(msg)) for msg in agent.messages)
     context_window = agent.agent_state.llm_config.context_window
     overflow_threshold = MESSAGE_SUMMARY_WARNING_FRAC * context_window
@@ -238,6 +229,7 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
                                 "distance": distances[i]
                             })
                         
+                        # Sort by distance (normal focus: furthest first, inverted focus: closest first)
                         reverse_sort = False if score_mode == "inverted_focus" else True
                         sorted_messages_by_distance = sorted(messages_with_distances, key=lambda x: x["distance"], reverse=reverse_sort)
                         
@@ -255,7 +247,7 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
         except Exception as sum_e:
             return f"ERROR: MANUAL_SUMMARIZATION_FAILED: {sum_e}"
 
-    # 4. Trigger reasoning with the final question
+    # 4. Ask the final question
     final_question = test_case['question']
     final_question_json = json.dumps({"type": "user_message", "message": final_question})
     
@@ -283,8 +275,7 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
 
 def create_custom_message_pair_embeddings(message_sequence, embedding_config):
     """
-    Custom embedding function for plain text messages (not JSON).
-    Creates vector embeddings for message pairs (user message and subsequent assistant message).
+    Create embeddings for user-assistant message pairs.
     """
     from memgpt.embeddings import create_embedding
     
@@ -330,38 +321,28 @@ def create_custom_message_pair_embeddings(message_sequence, embedding_config):
 
     return pair_embeddings
 
-def write_results_safely(results_batch, output_path, scoring_path=None):
+def write_results_safely(results_batch, output_path):
     """
-    Thread-safe function to write results to output files.
+    Thread-safe function to write results to output file.
     """
-    # Write main results
     with output_lock:
         with open(output_path, 'a', encoding='utf-8') as outfile:
             for result_data in results_batch:
                 if result_data["success"]:
                     outfile.write(json.dumps(result_data["result"]) + '\n')
                     outfile.flush()
-    
-    # Write scoring data if provided
-    if scoring_path:
-        with scoring_lock:
-            with open(scoring_path, 'a', encoding='utf-8') as scoring_outfile:
-                for result_data in results_batch:
-                    if result_data["success"] and result_data.get("scoring_analysis"):
-                        scoring_outfile.write(json.dumps(result_data["scoring_analysis"]) + '\n')
-                        scoring_outfile.flush()
 
 def main():
-    """Main execution function with parallel processing support."""
-    print("===== MemGPT LongMemEval Parallel Benchmark Script =====")
+    """Main execution function with parallel case processing for temporal reasoning."""
+    print("===== MemGPT LongMemEval TEMPORAL REASONING Case-Parallel Benchmark Script =====")
     
     # --- Argument Parsing ---
-    parser = argparse.ArgumentParser(description="Run MemGPT LongMemEval benchmark with parallel processing")
+    parser = argparse.ArgumentParser(description="Run MemGPT LongMemEval benchmark with parallel case processing (TEMPORAL REASONING ONLY)")
     parser.add_argument("--test", action="store_true", help="Run in test mode (limited cases)")
     parser.add_argument("--mode", choices=["focus", "fifo", "hybrid"], default="focus", help="Memory mode")
     parser.add_argument("--beta", type=float, default=0.5, help="Beta parameter for hybrid mode (0.0-1.0)")
     parser.add_argument("--cluster", action="store_true", help="Enable clustering-based summarization")
-    parser.add_argument("--prompt-type", choices=["memgpt_default", "xml", "xml_temporal_reasoning"], default="memgpt_default", help="Prompt type")
+    parser.add_argument("--prompt-type", choices=["memgpt_default", "xml", "xml_temporal_reasoning"], default="xml_temporal_reasoning", help="Prompt type")
     parser.add_argument("--centroid-method", choices=["centroid", "medoid"], default="centroid", help="Centroid calculation method")
     parser.add_argument("--score-mode", choices=["inverted_focus"], help="Score mode modifier")
     parser.add_argument("--batch-size", type=int, default=4, help="Number of test cases to run in parallel")
@@ -377,7 +358,7 @@ def main():
     if args.max_workers is None:
         args.max_workers = args.batch_size
     
-    print(f"Configuration:")
+    print(f"Configuration (TEMPORAL REASONING):")
     print(f"  Memory mode: {args.mode.upper()}")
     print(f"  Beta parameter: {args.beta}")
     print(f"  Clustering: {'ENABLED' if args.cluster else 'DISABLED'}")
@@ -388,9 +369,9 @@ def main():
     print(f"  Max workers: {args.max_workers}")
     print(f"  Test mode: {'ON' if args.test else 'OFF'}")
     
-    # Create output paths
+    # Create output path
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"memgpt_hypotheses_parallel_{args.prompt_type}_{args.mode}"
+    output_filename = f"memgpt_hypotheses_temporal_reasoning_{args.prompt_type}_{args.mode}"
     if args.mode == "hybrid":
         output_filename += f"_beta{args.beta}"
     if args.cluster:
@@ -411,10 +392,10 @@ def main():
     
     test_cases = load_and_filter_data()
     
-    # Filter for test mode
+    # Filter for test mode  
     if args.test:
-        test_cases = test_cases[0:25]  # Use same range as original
-        print(f"Test mode: Limited to {len(test_cases)} cases")
+        test_cases = test_cases[0:10]  # Use fewer cases for test mode since temporal reasoning might be limited
+        print(f"Test mode: Limited to {len(test_cases)} temporal reasoning cases")
     
     # --- RESUME LOGIC ---
     completed_question_ids = set()
@@ -436,12 +417,12 @@ def main():
     remaining_test_cases = [case for case in test_cases if case['question_id'] not in completed_question_ids]
     
     if completed_question_ids and not args.test:
-        print(f"Found {len(completed_question_ids)} completed instances. Resuming with {len(remaining_test_cases)} remaining cases.")
+        print(f"Found {len(completed_question_ids)} completed instances. Resuming with {len(remaining_test_cases)} remaining temporal reasoning cases.")
     else:
-        print(f"Starting {'test' if args.test else 'benchmark'} run on {len(remaining_test_cases)} cases.")
+        print(f"Starting {'test' if args.test else 'benchmark'} run on {len(remaining_test_cases)} temporal reasoning cases.")
     
     if not remaining_test_cases:
-        print("No remaining test cases to process!")
+        print("No remaining temporal reasoning test cases to process!")
         return
     
     # --- PARALLEL PROCESSING ---
@@ -469,7 +450,7 @@ def main():
     try:
         with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
             # Process in batches
-            for batch_start in tqdm(range(0, len(worker_args), args.batch_size), desc="Processing batches"):
+            for batch_start in tqdm(range(0, len(worker_args), args.batch_size), desc="Processing temporal reasoning batches"):
                 batch_end = min(batch_start + args.batch_size, len(worker_args))
                 batch_args = worker_args[batch_start:batch_end]
                 
@@ -487,7 +468,7 @@ def main():
                             total_processed += 1
                         else:
                             total_errors += 1
-                            print(f"Error in case {result['question_id']}: {result.get('error', 'Unknown error')}")
+                            print(f"Error in temporal reasoning case {result['question_id']}: {result.get('error', 'Unknown error')}")
                             
                     except Exception as e:
                         total_errors += 1
@@ -497,15 +478,17 @@ def main():
                 write_results_safely(batch_results, output_path)
                 
                 # Progress update
-                print(f"Completed batch {batch_start//args.batch_size + 1}/{(len(worker_args) + args.batch_size - 1)//args.batch_size}. "
+                batch_num = batch_start // args.batch_size + 1
+                total_batches = (len(worker_args) + args.batch_size - 1) // args.batch_size
+                print(f"Completed temporal reasoning batch {batch_num}/{total_batches}. "
                       f"Total processed: {total_processed}, Errors: {total_errors}")
                       
     except KeyboardInterrupt:
-        print("\n\nBenchmark interrupted by user (Ctrl+C). Progress has been saved.")
+        print("\n\nTemporal reasoning benchmark interrupted by user (Ctrl+C). Progress has been saved.")
         print("To resume, simply run the script again.")
     
-    print(f"\n===== {'TEST' if args.test else 'BENCHMARK'} RUN COMPLETE =====")
-    print(f"Successfully processed: {total_processed} cases")
+    print(f"\n===== TEMPORAL REASONING {'TEST' if args.test else 'BENCHMARK'} RUN COMPLETE =====")
+    print(f"Successfully processed: {total_processed} temporal reasoning cases")
     print(f"Errors encountered: {total_errors} cases")
     print(f"Results saved to: {output_path}")
 

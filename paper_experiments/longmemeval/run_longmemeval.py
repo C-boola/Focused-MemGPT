@@ -284,12 +284,18 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
         # 4. Extract Hypothesis
         log_debug(f"Raw response from agent.step(): {response_messages}")
         if response_messages and isinstance(response_messages, list):
-            last_message = response_messages[-1]
-            if last_message['role'] == 'assistant':
-                hypothesis = last_message['content']
+            # Find the last assistant message in the response (in case there are function calls)
+            assistant_message = None
+            for msg in reversed(response_messages):
+                if msg.get('role') == 'assistant' and msg.get('content'):
+                    assistant_message = msg
+                    break
+            
+            if assistant_message:
+                hypothesis = assistant_message['content']
                 log_debug(f"Extracted hypothesis: '{hypothesis[:100]}...'")
             else:
-                hypothesis = "ERROR: FINAL_MESSAGE_NOT_FROM_ASSISTANT"
+                hypothesis = "ERROR: NO_ASSISTANT_MESSAGE_FOUND"
         
     except Exception as e:
         log_debug(f"ERROR in instance {q_id}: agent.step() failed. This could be a persistent context overflow or another API error. Exception: {e}")
@@ -404,13 +410,13 @@ def main():
 
     cluster_summaries = "--cluster" in args  # Default is False (clustering OFF)
 
-    prompt_type = "memgpt_default"  # Default prompt type
+    prompt_type = "xml"  # Default prompt type
     if "--prompt-type" in args:
         try:
             prompt_type_index = args.index("--prompt-type") + 1
             if prompt_type_index < len(args):
                 specified_prompt_type = args[prompt_type_index]
-                if specified_prompt_type in ["memgpt_default", "xml"]:
+                if specified_prompt_type in ["memgpt_default", "xml", "xml_temporal_reasoning"]:
                     prompt_type = specified_prompt_type
                 else:
                     print(f"Warning: Invalid prompt type '{specified_prompt_type}'. Defaulting to 'memgpt_default'.")
@@ -483,7 +489,7 @@ def main():
     
     # In test mode, only run first 3 cases
     if test_mode:
-        test_cases = test_cases[8:15]
+        test_cases = test_cases[0:25]
         print(f"Test mode: Limited to {len(test_cases)} cases")
     
     # --- RESUME LOGIC ---

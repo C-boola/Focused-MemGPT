@@ -195,6 +195,7 @@ class Agent(object):
         cluster_summaries: Optional[bool] = False,  # new clustering parameter
         centroid_method: Optional[str] = "centroid",  # new parameter to switch between centroid and medoid
         score_mode: Optional[str] = None,  # new parameter to modify scoring (e.g. "inverted_focus")
+        max_tokens: Optional[int] = None,  # new parameter to control compression target tokens
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
@@ -210,6 +211,10 @@ class Agent(object):
         # Validate score_mode parameter
         if score_mode is not None and score_mode not in ["inverted_focus"]:
             raise ValueError(f"Score mode must be 'inverted_focus' or None, got {score_mode}")
+        
+        # Validate max_tokens parameter
+        if max_tokens is not None and max_tokens <= 0:
+            raise ValueError(f"Max tokens must be positive, got {max_tokens}")
         
         # An agent can be created from a Preset object
         if preset is not None:
@@ -238,6 +243,7 @@ class Agent(object):
                     "cluster_summaries": cluster_summaries if cluster_summaries is not None else False, # Store cluster_summaries from preset creation
                     "centroid_method": centroid_method if centroid_method is not None else "centroid", # Store centroid_method from preset creation
                     "score_mode": score_mode, # Store score_mode from preset creation
+                    "max_tokens": max_tokens, # Store max_tokens from preset creation
                 },
             )
             self.mem_mode = mem_mode if mem_mode is not None else "focus"
@@ -245,6 +251,7 @@ class Agent(object):
             self.cluster_summaries = cluster_summaries if cluster_summaries is not None else False
             self.centroid_method = centroid_method if centroid_method is not None else "centroid"
             self.score_mode = score_mode  # Store score_mode
+            self.max_tokens = max_tokens  # Store max_tokens
             self.prompt_type = "memgpt_default"  # Default prompt type for preset-based agents
 
         # An agent can also be created directly from AgentState
@@ -259,6 +266,7 @@ class Agent(object):
             self.cluster_summaries = agent_state.state.get("cluster_summaries", False) # Load cluster_summaries from state
             self.centroid_method = agent_state.state.get("centroid_method", "centroid") # Load centroid_method from state
             self.score_mode = agent_state.state.get("score_mode", None) # Load score_mode from state
+            self.max_tokens = agent_state.state.get("max_tokens", None) # Load max_tokens from state
             self.prompt_type = agent_state.state.get("prompt_type", "memgpt_default") # Load prompt_type from state
 
         else:
@@ -1064,7 +1072,17 @@ class Agent(object):
         # Do not allow truncation of the last N messages, since these are needed for in-context examples of function calling
         token_counts = [count_tokens(str(msg)) for msg in self.messages]
         message_buffer_token_count = sum(token_counts[1:])  # no system message
-        desired_token_count_to_summarize = int(message_buffer_token_count * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+        current_total_tokens = sum(token_counts)  # include system message for total count
+        
+        if self.max_tokens is not None:
+            # Calculate how many tokens we need to summarize to reach max_tokens target
+            desired_token_count_to_summarize = max(0, current_total_tokens - self.max_tokens)
+            print(f"FIFO summarize: Using custom max_tokens target: {self.max_tokens}")
+            print(f"FIFO summarize: Current total tokens: {current_total_tokens}, need to summarize: {desired_token_count_to_summarize}")
+        else:
+            # Use the original fraction-based approach
+            desired_token_count_to_summarize = int(message_buffer_token_count * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+            print(f"FIFO summarize: Using fraction-based approach: summarizing {desired_token_count_to_summarize} tokens ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {message_buffer_token_count})")
         candidate_messages_to_summarize = self.messages[1:]
         token_counts = token_counts[1:]
 
@@ -1187,7 +1205,12 @@ class Agent(object):
                 LLM_MAX_TOKENS.get(self.model, LLM_MAX_TOKENS["DEFAULT"])
             )
         context_window = int(self.agent_state.llm_config.context_window)
-        target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+        if self.max_tokens is not None:
+            target_token_count = self.max_tokens
+            print(f"Focus summarize: Using custom max_tokens target: {target_token_count}")
+        else:
+            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+            print(f"Focus summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
 
         # Calculate current total tokens from self._messages
         current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -1375,7 +1398,12 @@ class Agent(object):
                 LLM_MAX_TOKENS.get(self.model, LLM_MAX_TOKENS["DEFAULT"])
             )
         context_window = int(self.agent_state.llm_config.context_window)
-        target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+        if self.max_tokens is not None:
+            target_token_count = self.max_tokens
+            print(f"Hybrid summarize: Using custom max_tokens target: {target_token_count}")
+        else:
+            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+            print(f"Hybrid summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
 
         # Calculate current total tokens from self._messages
         current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -1861,6 +1889,9 @@ class Agent(object):
             "mem_mode": self.mem_mode,  # Persist mem_mode
             "beta": self.beta,  # Persist beta
             "cluster_summaries": self.cluster_summaries,  # Persist cluster_summaries
+            "centroid_method": self.centroid_method,  # Persist centroid_method
+            "score_mode": self.score_mode,  # Persist score_mode
+            "max_tokens": self.max_tokens,  # Persist max_tokens
             "prompt_type": self.prompt_type,  # Persist prompt_type
         }
 
