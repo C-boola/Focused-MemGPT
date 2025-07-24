@@ -1171,16 +1171,18 @@ class Agent(object):
         prior_len = len(self.messages)
         self._trim_messages(cutoff)
         packed_summary_message = {"role": "user", "content": summary_message}
-        self._prepend_to_messages(
-            [
-                Message.dict_to_message(
-                    agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
-                    model=self.model,
-                    openai_message_dict=packed_summary_message,
-                )
-            ]
+        summary_message_obj = Message.dict_to_message(
+            agent_id=self.agent_state.id,
+            user_id=self.agent_state.user_id,
+            model=self.model,
+            openai_message_dict=packed_summary_message,
         )
+        
+        # MODIFIED: Bypass persistence for summary message to prevent it from being saved to recall memory
+        # self._prepend_to_messages([summary_message_obj]) # OLD LINE
+        self._messages = [self._messages[0]] + [summary_message_obj] + self._messages[1:]
+        self.messages_total += 1  # still should increment the message counter (summaries are additions too)
+        print("FIFO summarize: Prepended summary to in-memory prompt without persisting.")
 
         # reset alert
         self.agent_alerted_about_memory_pressure = False
@@ -1357,23 +1359,27 @@ class Agent(object):
         original_message_count = len(self._messages)
         new_messages_list = [msg for msg in self._messages if msg.id not in message_ids_to_remove_set]
         
-        if isinstance(self.persistence_manager, LocalStateManager):
-            deleted_count_pm = 0
-            for msg_id_to_delete in message_ids_to_remove_set:
-                try:
-                    if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
-                        self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
-                        deleted_count_pm +=1
-                except Exception as del_e:
-                    print(f"{CLI_WARNING_PREFIX}Focus summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
-            print(f"Focus summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
-        else:
-            print(f"{CLI_WARNING_PREFIX}Focus summarize: Persistence manager is not LocalStateManager or compatible; selective deletion from PM might not occur. Message list in AgentState will be updated.")
+        # DISABLED: Comment out deletion code to preserve messages in recall memory database
+        # if isinstance(self.persistence_manager, LocalStateManager):
+        #     deleted_count_pm = 0
+        #     for msg_id_to_delete in message_ids_to_remove_set:
+        #         try:
+        #             if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
+        #                 self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
+        #                 deleted_count_pm +=1
+        #         except Exception as del_e:
+        #             print(f"{CLI_WARNING_PREFIX}Focus summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
+        #     print(f"Focus summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
+        # else:
+        #     print(f"{CLI_WARNING_PREFIX}Focus summarize: Persistence manager is not LocalStateManager or compatible; selective deletion from PM might not occur. Message list in AgentState will be updated.")
+        print("Focus summarize: Message deletion from persistence disabled - preserving recall memory integrity.")
 
         self._messages = new_messages_list
         
-        # Prepend the summary message (this also handles persistence of the new summary message)
-        self._prepend_to_messages([summary_message_to_prepend])
+        # MODIFIED: Bypass persistence for summary message to prevent it from being saved to recall memory
+        # self._prepend_to_messages([summary_message_to_prepend]) # OLD LINE
+        self._messages = [self._messages[0]] + [summary_message_to_prepend] + self._messages[1:]
+        print("Focus summarize: Prepended summary to in-memory prompt without persisting.")
         
         self.agent_alerted_about_memory_pressure = False
         
@@ -1631,20 +1637,25 @@ class Agent(object):
         original_message_count = len(self._messages)
         new_messages_list = [msg for msg in self._messages if msg.id not in message_ids_to_remove_set]
 
+        # DISABLED: Comment out deletion code to preserve messages in recall memory database
         # Clean up persistence manager
-        if isinstance(self.persistence_manager, LocalStateManager):
-            deleted_count_pm = 0
-            for msg_id_to_delete in message_ids_to_remove_set:
-                try:
-                    if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
-                        self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
-                        deleted_count_pm += 1
-                except Exception as del_e:
-                    print(f"{CLI_WARNING_PREFIX}Hybrid summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
-            print(f"Hybrid summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
+        # if isinstance(self.persistence_manager, LocalStateManager):
+        #     deleted_count_pm = 0
+        #     for msg_id_to_delete in message_ids_to_remove_set:
+        #         try:
+        #             if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
+        #                 self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
+        #                 deleted_count_pm += 1
+        #         except Exception as del_e:
+        #             print(f"{CLI_WARNING_PREFIX}Hybrid summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
+        #     print(f"Hybrid summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
+        print("Hybrid summarize: Message deletion from persistence disabled - preserving recall memory integrity.")
 
         self._messages = new_messages_list
-        self._prepend_to_messages([summary_message_to_prepend])
+        # MODIFIED: Bypass persistence for summary message to prevent it from being saved to recall memory
+        # self._prepend_to_messages([summary_message_to_prepend]) # OLD LINE
+        self._messages = [self._messages[0]] + [summary_message_to_prepend] + self._messages[1:]
+        print("Hybrid summarize: Prepended summary to in-memory prompt without persisting.")
         self.agent_alerted_about_memory_pressure = False
 
         final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
