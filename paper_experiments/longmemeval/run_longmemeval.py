@@ -246,6 +246,20 @@ def run_test_instance(base_config: MemGPTConfig, test_case: dict, memory_mode: s
                 agent.summarize_messages_hybrid_inplace()
                 log_debug("Hybrid mode summarization completed successfully.")
                 
+            elif memory_mode == "pure_cluster":
+                print("=" * 70)
+                print("  ||  MANUAL PURE CLUSTER MODE SUMMARIZATION TRIGGERED  ||")
+                print("=" * 70)
+                agent.summarize_messages_pure_cluster_inplace()
+                log_debug("Pure cluster mode summarization completed successfully.")
+                
+            elif memory_mode == "density":
+                print("=" * 70)
+                print("  ||  MANUAL DENSITY MODE SUMMARIZATION TRIGGERED  ||")
+                print("=" * 70)
+                agent.summarize_messages_density_inplace()
+                log_debug("Density mode summarization completed successfully.")
+                
             else:  # FIFO mode
                 print("=" * 70)
                 print("  ||  MANUAL FIFO MODE SUMMARIZATION TRIGGERED  ||")
@@ -384,7 +398,7 @@ def main():
             mode_index = args.index("--mode") + 1
             if mode_index < len(args):
                 specified_mode = args[mode_index]
-                if specified_mode in ["focus", "fifo", "hybrid"]:
+                if specified_mode in ["focus", "fifo", "hybrid", "pure_cluster", "density"]:
                     memory_mode = specified_mode
                 else:
                     print(f"Warning: Invalid memory mode '{specified_mode}'. Defaulting to 'focus'.")
@@ -408,7 +422,22 @@ def main():
         except (ValueError, IndexError):
             print("Error parsing --beta flag (must be a number between 0.0 and 1.0). Defaulting to 0.5.")
 
-    cluster_summaries = "--cluster" in args  # Default is False (clustering OFF)
+    cluster_summaries = False  # Default is False (clustering OFF)
+    if "--cluster" in args:
+        try:
+            cluster_index = args.index("--cluster") + 1
+            if cluster_index < len(args):
+                specified_cluster = args[cluster_index].lower()
+                if specified_cluster == "true":
+                    cluster_summaries = True
+                elif specified_cluster == "false":
+                    cluster_summaries = False
+                else:
+                    print(f"Warning: Invalid cluster value '{args[cluster_index]}'. Must be 'True' or 'False'. Defaulting to False.")
+            else:
+                print("Warning: --cluster flag used without a value. Defaulting to False.")
+        except (ValueError, IndexError):
+            print("Error parsing --cluster flag. Defaulting to False.")
 
     prompt_type = "xml"  # Default prompt type
     if "--prompt-type" in args:
@@ -455,6 +484,26 @@ def main():
         except (ValueError, IndexError):
             print("Error parsing --score-mode flag. Defaulting to None.")
 
+    trunc_frac = 0.75  # Default truncation fraction
+    if "--trunc-frac" in args:
+        try:
+            trunc_frac_index = args.index("--trunc-frac") + 1
+            if trunc_frac_index < len(args):
+                specified_trunc_frac = float(args[trunc_frac_index])
+                if 0.0 < specified_trunc_frac <= 1.0:
+                    trunc_frac = specified_trunc_frac
+                else:
+                    print(f"Warning: Truncation fraction must be between 0.0 and 1.0, got {specified_trunc_frac}. Defaulting to 0.75.")
+            else:
+                print("Warning: --trunc-frac flag used without a value. Defaulting to 0.75.")
+        except (ValueError, IndexError):
+            print("Error parsing --trunc-frac flag. Defaulting to 0.75.")
+
+    # Set the global truncation fraction constant
+    import memgpt.constants
+    memgpt.constants.MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC = trunc_frac
+    print(f"Set MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC to {trunc_frac}")
+
     if test_mode:
         print("RUNNING IN TEST MODE - Will process only first 3 cases with verbose output")
     print(f"Using memory mode: {memory_mode.upper()}")
@@ -466,6 +515,7 @@ def main():
     print(f"Prompt type: {prompt_type}")
     print(f"Centroid method: {centroid_method.upper()}")
     print(f"Score mode: {score_mode.upper() if score_mode else 'NONE'}")
+    print(f"Truncation fraction: {trunc_frac}")
     
     # Create output path based on mode, beta, clustering, centroid method, score mode, and prompt type
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -477,6 +527,7 @@ def main():
     output_filename += f"_{centroid_method}"
     if score_mode:
         output_filename += f"_{score_mode}"
+    output_filename += f"_trunc{trunc_frac}"
     if test_mode:
         output_filename += "_test"
     output_filename += f"_{timestamp}"

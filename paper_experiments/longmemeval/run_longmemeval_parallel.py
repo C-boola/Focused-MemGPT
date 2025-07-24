@@ -249,6 +249,10 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
                     
             elif memory_mode == "hybrid":
                 agent.summarize_messages_hybrid_inplace()
+            elif memory_mode == "pure_cluster":
+                agent.summarize_messages_pure_cluster_inplace()
+            elif memory_mode == "density":
+                agent.summarize_messages_density_inplace()
             else:  # FIFO mode
                 agent.summarize_messages_inplace()
                 
@@ -358,32 +362,46 @@ def main():
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="Run MemGPT LongMemEval benchmark with parallel processing")
     parser.add_argument("--test", action="store_true", help="Run in test mode (limited cases)")
-    parser.add_argument("--mode", choices=["focus", "fifo", "hybrid"], default="focus", help="Memory mode")
+    parser.add_argument("--mode", choices=["focus", "fifo", "hybrid", "pure_cluster", "density"], default="focus", help="Memory mode")
     parser.add_argument("--beta", type=float, default=0.5, help="Beta parameter for hybrid mode (0.0-1.0)")
-    parser.add_argument("--cluster", action="store_true", help="Enable clustering-based summarization")
+    parser.add_argument("--cluster", type=str, choices=["True", "False"], help="Enable clustering-based summarization")
     parser.add_argument("--prompt-type", choices=["memgpt_default", "xml", "xml_temporal_reasoning"], default="memgpt_default", help="Prompt type")
     parser.add_argument("--centroid-method", choices=["centroid", "medoid"], default="centroid", help="Centroid calculation method")
     parser.add_argument("--score-mode", choices=["inverted_focus"], help="Score mode modifier")
     parser.add_argument("--batch-size", type=int, default=4, help="Number of test cases to run in parallel")
     parser.add_argument("--max-workers", type=int, help="Maximum number of worker processes (default: batch-size)")
+    parser.add_argument("--trunc-frac", type=float, default=0.75, help="Token truncation fraction during summarization (default: 0.75)")
     
     args = parser.parse_args()
+    
+    # Convert cluster string to boolean
+    cluster_bool = args.cluster == "True" if args.cluster else False
     
     # Validate arguments
     if not (0.0 <= args.beta <= 1.0):
         print(f"Error: Beta must be between 0.0 and 1.0, got {args.beta}")
         return
     
+    if not (0.0 < args.trunc_frac <= 1.0):
+        print(f"Error: Truncation fraction must be between 0.0 and 1.0, got {args.trunc_frac}")
+        return
+    
     if args.max_workers is None:
         args.max_workers = args.batch_size
+    
+    # Set the global truncation fraction constant
+    import memgpt.constants
+    memgpt.constants.MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC = args.trunc_frac
+    print(f"Set MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC to {args.trunc_frac}")
     
     print(f"Configuration:")
     print(f"  Memory mode: {args.mode.upper()}")
     print(f"  Beta parameter: {args.beta}")
-    print(f"  Clustering: {'ENABLED' if args.cluster else 'DISABLED'}")
+    print(f"  Clustering: {'ENABLED' if cluster_bool else 'DISABLED'}")
     print(f"  Prompt type: {args.prompt_type}")
     print(f"  Centroid method: {args.centroid_method.upper()}")
     print(f"  Score mode: {args.score_mode.upper() if args.score_mode else 'NONE'}")
+    print(f"  Truncation fraction: {args.trunc_frac}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Max workers: {args.max_workers}")
     print(f"  Test mode: {'ON' if args.test else 'OFF'}")
@@ -393,11 +411,12 @@ def main():
     output_filename = f"memgpt_hypotheses_parallel_{args.prompt_type}_{args.mode}"
     if args.mode == "hybrid":
         output_filename += f"_beta{args.beta}"
-    if args.cluster:
+    if cluster_bool:
         output_filename += "_cluster"
     output_filename += f"_{args.centroid_method}"
     if args.score_mode:
         output_filename += f"_{args.score_mode}"
+    output_filename += f"_trunc{args.trunc_frac}"
     if args.test:
         output_filename += "_test"
     output_filename += f"_batch{args.batch_size}_{timestamp}"
@@ -452,7 +471,7 @@ def main():
     for i, test_case in enumerate(remaining_test_cases):
         worker_id = i % args.max_workers
         args_tuple = (
-            test_case, config_dict, args.mode, args.beta, args.cluster,
+            test_case, config_dict, args.mode, args.beta, cluster_bool,
             args.prompt_type, args.centroid_method, args.score_mode, worker_id
         )
         worker_args.append(args_tuple)

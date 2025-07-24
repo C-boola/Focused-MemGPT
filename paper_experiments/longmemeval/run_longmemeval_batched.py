@@ -12,16 +12,18 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Tuple
 
-def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid") -> Tuple[float, int, str]:
+def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = False, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid", trunc_frac: float = 0.75) -> Tuple[float, int, str]:
     """Run a single beta value using the original script."""
     script_path = os.path.join(os.path.dirname(__file__), "run_longmemeval.py")
     
     # Build command
     cmd = [sys.executable, script_path, "--mode", memory_mode, "--beta", str(beta), "--prompt-type", prompt_type, "--centroid-method", centroid_method]
+    if trunc_frac != 0.75:  # Only add if different from default
+        cmd.extend(["--trunc-frac", str(trunc_frac)])
     if test_mode:
         cmd.append("--test")
     if cluster_summaries:
-        cmd.append("--cluster")
+        cmd.extend(["--cluster", "True"])
     
     clustering_status = "with clustering" if cluster_summaries else "without clustering"
     print(f"[BATCH] Starting beta={beta} {clustering_status}")
@@ -42,7 +44,7 @@ def run_single_beta(beta: float, memory_mode: str = "hybrid", test_mode: bool = 
         print(f"[BATCH] ✗ Beta={beta} exception: {e}")
         return beta, -2, str(e)
 
-def run_beta_batch(beta_batch: List[float], memory_mode: str, test_mode: bool, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid") -> List[Tuple[float, int, str]]:
+def run_beta_batch(beta_batch: List[float], memory_mode: str, test_mode: bool, cluster_summaries: bool = False, prompt_type: str = "memgpt_default", centroid_method: str = "centroid", trunc_frac: float = 0.75) -> List[Tuple[float, int, str]]:
     """Run a batch of beta values in parallel."""
     print(f"\n{'='*60}")
     print(f"RUNNING BATCH: {beta_batch}")
@@ -53,7 +55,7 @@ def run_beta_batch(beta_batch: List[float], memory_mode: str, test_mode: bool, c
     
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_beta = {
-            executor.submit(run_single_beta, beta, memory_mode, test_mode, cluster_summaries, prompt_type, centroid_method): beta 
+            executor.submit(run_single_beta, beta, memory_mode, test_mode, cluster_summaries, prompt_type, centroid_method, trunc_frac): beta 
             for beta in beta_batch
         }
         
@@ -71,7 +73,7 @@ def run_beta_batch(beta_batch: List[float], memory_mode: str, test_mode: bool, c
 def main():
     """Main function to run beta values in batches."""
     parser = argparse.ArgumentParser(description="Run LongMemEval benchmark in batches to avoid DB connection limits")
-    parser.add_argument("--mode", choices=["focus", "fifo", "hybrid"], default="hybrid",
+    parser.add_argument("--mode", choices=["focus", "fifo", "hybrid", "pure_cluster", "density"], default="hybrid",
                        help="Memory mode to use (default: hybrid)")
     parser.add_argument("--test", action="store_true",
                        help="Run in test mode (first 3 cases only)")
@@ -83,14 +85,24 @@ def main():
                        help="Ending beta value (default: 1.0)")
     parser.add_argument("--beta-step", type=float, default=0.1,
                        help="Beta increment step (default: 0.1)")
-    parser.add_argument("--cluster", action="store_true",
-                       help="Enable clustering-based summarization (default: disabled)")
+    parser.add_argument("--cluster", type=str, choices=["True", "False"], 
+                       help="Enable clustering-based summarization (default: False)")
     parser.add_argument("--prompt-type", choices=["memgpt_default", "xml"], default="memgpt_default",
                        help="Prompt type to use (default: memgpt_default)")
     parser.add_argument("--centroid-method", choices=["centroid", "medoid"], default="centroid",
                        help="Method to use for calculating representative vector (default: centroid)")
+    parser.add_argument("--trunc-frac", type=float, default=0.75,
+                       help="Token truncation fraction during summarization (default: 0.75)")
     
     args = parser.parse_args()
+    
+    # Convert cluster string to boolean
+    cluster_bool = args.cluster == "True" if args.cluster else False
+    
+    # Validate truncation fraction
+    if not (0.0 < args.trunc_frac <= 1.0):
+        print(f"Error: Truncation fraction must be between 0.0 and 1.0, got {args.trunc_frac}")
+        return
     
     # Generate beta values
     beta_values = []
@@ -110,9 +122,10 @@ def main():
     print("=" * 70)
     print(f"Memory mode: {args.mode}")
     print(f"Test mode: {'ON' if args.test else 'OFF'}")
-    print(f"Clustering-based summarization: {'ENABLED' if args.cluster else 'DISABLED'}")
+    print(f"Clustering-based summarization: {'ENABLED' if cluster_bool else 'DISABLED'}")
     print(f"Prompt type: {args.prompt_type}")
     print(f"Centroid method: {args.centroid_method}")
+    print(f"Truncation fraction: {args.trunc_frac}")
     print(f"Beta values: {beta_values}")
     print(f"Batch size: {args.batch_size}")
     print(f"Number of batches: {len(batches)}")
@@ -126,7 +139,7 @@ def main():
     # Run each batch sequentially
     for batch_num, beta_batch in enumerate(batches, 1):
         print(f"\n🚀 Starting Batch {batch_num}/{len(batches)}")
-        batch_results = run_beta_batch(beta_batch, args.mode, args.test, args.cluster, args.prompt_type, args.centroid_method)
+        batch_results = run_beta_batch(beta_batch, args.mode, args.test, cluster_bool, args.prompt_type, args.centroid_method, args.trunc_frac)
         all_results.extend(batch_results)
         
         # Update counters
@@ -167,7 +180,7 @@ def main():
         output_filename = f"memgpt_hypotheses_{args.prompt_type}_{args.mode}"
         if args.mode == "hybrid":
             output_filename += f"_beta{beta}"
-        if args.cluster:
+        if cluster_bool:
             output_filename += "_cluster"
         output_filename += f"_{args.centroid_method}"
         filename = f"{output_filename}.jsonl"

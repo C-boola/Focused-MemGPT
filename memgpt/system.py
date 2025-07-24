@@ -158,7 +158,8 @@ def package_system_message(system_message, message_type="system_alert", time=Non
 def package_summarize_message(summary, summary_length, hidden_message_count, total_message_count, timestamp=None):
     context_message = (
         f"Note: prior messages ({hidden_message_count} of {total_message_count} total messages) have been hidden from view due to conversation memory constraints.\n"
-        + f"The following is a summary of the previous {summary_length} messages:\n {summary}"
+        + f"The following is a summary of the previous {summary_length} messages:\n {summary}\n\n"
+        + f"Please respond normally to any questions that follow. The above is background context from previous conversation."
     )
 
     formatted_time = get_local_time() if timestamp is None else timestamp
