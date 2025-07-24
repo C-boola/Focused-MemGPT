@@ -204,6 +204,11 @@ class Agent(object):
         if beta is not None and (beta < 0.0 or beta > 1.0):
             raise ValueError(f"Beta parameter must be between 0.0 and 1.0, got {beta}")
         
+        # Validate memory mode parameter
+        valid_mem_modes = ["focus", "fifo", "hybrid", "pure_cluster", "density"]
+        if mem_mode is not None and mem_mode not in valid_mem_modes:
+            raise ValueError(f"Memory mode must be one of {valid_mem_modes}, got {mem_mode}")
+        
         # Validate centroid_method parameter
         if centroid_method is not None and centroid_method not in ["centroid", "medoid"]:
             raise ValueError(f"Centroid method must be 'centroid' or 'medoid', got {centroid_method}")
@@ -1344,7 +1349,7 @@ class Agent(object):
         # For now, let's consider 'hidden' as those we just summarized.
         # The existing `package_summarize_message` is tied to FIFO logic's view of history.
         # We will create a slightly different summary string for focus mode.
-        summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} prior messages that were less central to the recent conversation flow]:\n{summary_text}"
+        summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} prior messages that were less central to the recent conversation flow]:\n{summary_text}\n\n[Note: Please respond normally to any questions that follow. The above is background context from previous conversation.]"
 
         summary_message_to_prepend = Message.dict_to_message(
             agent_id=self.agent_state.id,
@@ -1417,84 +1422,126 @@ class Agent(object):
 
         print(f"Hybrid summarize: Need to free approximately {tokens_to_free} tokens. Beta={self.beta}")
 
-        # Step 1: Generate message pair embeddings for focus approach
-        print("Hybrid summarize: Generating embeddings for focus component...")
-        try:
-            message_pair_embeddings_with_ids = self._create_robust_message_pair_embeddings(
-                message_sequence=self._messages, 
-                embedding_config=self.agent_state.embedding_config
-            )
-            if not message_pair_embeddings_with_ids:
-                print("Hybrid summarize: No message pair embeddings generated. Falling back to pure FIFO mode.")
+        # OPTIMIZATION: If beta=0, skip embeddings and use pure FIFO mode
+        if self.beta == 0.0:
+            print("Hybrid summarize: Beta=0 detected, skipping expensive embedding computation and using pure FIFO approach.")
+            
+            # Create message pairs without embeddings, just user-assistant sequence pairs
+            message_pairs_without_embeddings = []
+            for i in range(len(self._messages) - 1):
+                msg1 = self._messages[i]
+                msg2 = self._messages[i+1]
+                if msg1.role == "user" and msg2.role == "assistant" and msg1.id is not None and msg2.id is not None:
+                    message_pairs_without_embeddings.append((msg1.id, msg2.id))
+            
+            if not message_pairs_without_embeddings:
+                print("Hybrid summarize: No user-assistant message pairs found. Falling back to regular FIFO mode.")
                 self.summarize_messages_inplace()
                 return
-        except Exception as emb_e:
-            print(f"Hybrid summarize: Error generating embeddings: {emb_e}. Falling back to pure FIFO mode.")
-            self.summarize_messages_inplace()
-            return
+                
+            print(f"Hybrid summarize: Found {len(message_pairs_without_embeddings)} user-assistant pairs for FIFO processing")
+            
+            # Create only FIFO scores (no focus scores needed when beta=0)
+            pair_hybrid_scores = {}
+            message_id_to_position = {msg.id: idx for idx, msg in enumerate(self._messages)}
+            max_position = len(self._messages) - 1
+            
+            for user_msg_id, assistant_msg_id in message_pairs_without_embeddings:
+                user_pos = message_id_to_position.get(user_msg_id, 0)
+                asst_pos = message_id_to_position.get(assistant_msg_id, 0)
+                avg_position = (user_pos + asst_pos) / 2.0
+                
+                # Pure FIFO score: older messages (lower position) get higher scores for removal
+                if max_position > 0:
+                    fifo_score = (max_position - avg_position) / max_position
+                else:
+                    fifo_score = 0.0
+                
+                fifo_score = max(0.0, min(1.0, fifo_score))
+                
+                # Since beta=0: hybrid_score = focus_component * 0 + fifo_component * 1 = fifo_score
+                pair_hybrid_scores[(user_msg_id, assistant_msg_id)] = fifo_score
 
-        # Extract just the embedding vectors for centroid/medoid and distance calculation
-        actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
-
-        # Calculate centroid or medoid based on the configured method
-        if self.centroid_method == "medoid":
-            centroid_vec = calculate_medoid(actual_embedding_vectors)
         else:
-            centroid_vec = calculate_centroid(actual_embedding_vectors)
-        
-        if centroid_vec is None:
-            print(f"Hybrid summarize: {self.centroid_method.capitalize()} calculation failed. Falling back to pure FIFO mode.")
-            self.summarize_messages_inplace()
-            return
+            # Beta > 0, proceed with full hybrid approach including embeddings
+            # Step 1: Generate message pair embeddings for focus approach
+            print("Hybrid summarize: Generating embeddings for focus component...")
+            try:
+                message_pair_embeddings_with_ids = self._create_robust_message_pair_embeddings(
+                    message_sequence=self._messages, 
+                    embedding_config=self.agent_state.embedding_config
+                )
+                if not message_pair_embeddings_with_ids:
+                    print("Hybrid summarize: No message pair embeddings generated. Falling back to pure FIFO mode.")
+                    self.summarize_messages_inplace()
+                    return
+            except Exception as emb_e:
+                print(f"Hybrid summarize: Error generating embeddings: {emb_e}. Falling back to pure FIFO mode.")
+                self.summarize_messages_inplace()
+                return
 
-        # Convert list of list to list of np.array for distance calculation
-        np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
-        distances = calculate_cosine_distances(centroid_vec, np_embedding_vectors)
+            # Extract just the embedding vectors for centroid/medoid and distance calculation
+            actual_embedding_vectors = [pair[2] for pair in message_pair_embeddings_with_ids]
 
-        # Step 2: Create focus scores (distance-based, for pairs)
-        pair_focus_scores = {}
-        max_distance = max(distances) if distances else 1.0
-        for i, pair_data in enumerate(message_pair_embeddings_with_ids):
-            user_msg_id = pair_data[0]
-            assistant_msg_id = pair_data[1]
-            # Normalize distance (higher distance = higher score for removal)
-            normalized_distance = distances[i] / max_distance if max_distance > 0 else 0.0
-            pair_focus_scores[(user_msg_id, assistant_msg_id)] = normalized_distance
-
-        # Step 3: Create FIFO scores (chronological order, for pairs) - FIXED VERSION
-        pair_fifo_scores = {}
-        
-        # Create mapping from message ID to actual position in conversation
-        message_id_to_position = {msg.id: idx for idx, msg in enumerate(self._messages)}
-        max_position = len(self._messages) - 1
-        
-        # Create FIFO scores where older pairs get higher scores (more likely to be removed)
-        for user_msg_id, assistant_msg_id, _ in message_pair_embeddings_with_ids:
-            # Get actual positions in the conversation
-            user_pos = message_id_to_position.get(user_msg_id, 0)
-            asst_pos = message_id_to_position.get(assistant_msg_id, 0)
-            
-            # Use average position of the pair
-            avg_position = (user_pos + asst_pos) / 2.0
-            
-            # Normalize: older messages (lower position) get higher scores for removal
-            if max_position > 0:
-                fifo_score = (max_position - avg_position) / max_position
+            # Calculate centroid or medoid based on the configured method
+            if self.centroid_method == "medoid":
+                centroid_vec = calculate_medoid(actual_embedding_vectors)
             else:
-                fifo_score = 0.0
+                centroid_vec = calculate_centroid(actual_embedding_vectors)
             
-            # Ensure score is between 0 and 1
-            fifo_score = max(0.0, min(1.0, fifo_score))
-            
-            pair_fifo_scores[(user_msg_id, assistant_msg_id)] = fifo_score
+            if centroid_vec is None:
+                print(f"Hybrid summarize: {self.centroid_method.capitalize()} calculation failed. Falling back to pure FIFO mode.")
+                self.summarize_messages_inplace()
+                return
 
-        # Step 4: Combine scores using beta weighting
-        pair_hybrid_scores = {}
-        
-        for pair_key in pair_focus_scores.keys():
-            focus_component = pair_focus_scores.get(pair_key, 0.0) * self.beta
-            fifo_component = pair_fifo_scores.get(pair_key, 0.0) * (1.0 - self.beta)
-            pair_hybrid_scores[pair_key] = focus_component + fifo_component
+            # Convert list of list to list of np.array for distance calculation
+            np_embedding_vectors = [np.array(vec) for vec in actual_embedding_vectors]
+            distances = calculate_cosine_distances(centroid_vec, np_embedding_vectors)
+
+            # Step 2: Create focus scores (distance-based, for pairs)
+            pair_focus_scores = {}
+            max_distance = max(distances) if distances else 1.0
+            for i, pair_data in enumerate(message_pair_embeddings_with_ids):
+                user_msg_id = pair_data[0]
+                assistant_msg_id = pair_data[1]
+                # Normalize distance (higher distance = higher score for removal)
+                normalized_distance = distances[i] / max_distance if max_distance > 0 else 0.0
+                pair_focus_scores[(user_msg_id, assistant_msg_id)] = normalized_distance
+
+            # Step 3: Create FIFO scores (chronological order, for pairs) - FIXED VERSION
+            pair_fifo_scores = {}
+            
+            # Create mapping from message ID to actual position in conversation
+            message_id_to_position = {msg.id: idx for idx, msg in enumerate(self._messages)}
+            max_position = len(self._messages) - 1
+            
+            # Create FIFO scores where older pairs get higher scores (more likely to be removed)
+            for user_msg_id, assistant_msg_id, _ in message_pair_embeddings_with_ids:
+                # Get actual positions in the conversation
+                user_pos = message_id_to_position.get(user_msg_id, 0)
+                asst_pos = message_id_to_position.get(assistant_msg_id, 0)
+                
+                # Use average position of the pair
+                avg_position = (user_pos + asst_pos) / 2.0
+                
+                # Normalize: older messages (lower position) get higher scores for removal
+                if max_position > 0:
+                    fifo_score = (max_position - avg_position) / max_position
+                else:
+                    fifo_score = 0.0
+                
+                # Ensure score is between 0 and 1
+                fifo_score = max(0.0, min(1.0, fifo_score))
+                
+                pair_fifo_scores[(user_msg_id, assistant_msg_id)] = fifo_score
+
+            # Step 4: Combine scores using beta weighting
+            pair_hybrid_scores = {}
+            
+            for pair_key in pair_focus_scores.keys():
+                focus_component = pair_focus_scores.get(pair_key, 0.0) * self.beta
+                fifo_component = pair_fifo_scores.get(pair_key, 0.0) * (1.0 - self.beta)
+                pair_hybrid_scores[pair_key] = focus_component + fifo_component
 
         print(f"Hybrid summarize: Generated {len(pair_hybrid_scores)} hybrid pair scores (beta={self.beta})")
 
@@ -1575,15 +1622,26 @@ class Agent(object):
         selected_fifo_scores = []
         selected_hybrid_scores = []
         
-        # Group message IDs back into pairs for score lookup using ORIGINAL hybrid scores
-        for (user_msg_id, assistant_msg_id), original_hybrid_score in pair_hybrid_scores.items():
-            if user_msg_id in message_ids_to_remove_set and assistant_msg_id in message_ids_to_remove_set:
-                focus_score = pair_focus_scores.get((user_msg_id, assistant_msg_id), 0.0)
-                fifo_score = pair_fifo_scores.get((user_msg_id, assistant_msg_id), 0.0)
-                selected_focus_scores.append(focus_score)
-                selected_fifo_scores.append(fifo_score)
-                selected_hybrid_scores.append(original_hybrid_score)
-                print(f"  Pair (User: {user_msg_id}, Asst: {assistant_msg_id}): Focus={focus_score:.4f}, FIFO={fifo_score:.4f}, Hybrid={original_hybrid_score:.4f}")
+        # Handle beta=0 case where focus scores don't exist
+        if self.beta == 0.0:
+            # When beta=0, we only have FIFO scores (which are the hybrid scores)
+            for (user_msg_id, assistant_msg_id), original_hybrid_score in pair_hybrid_scores.items():
+                if user_msg_id in message_ids_to_remove_set and assistant_msg_id in message_ids_to_remove_set:
+                    focus_score = 0.0  # No focus component when beta=0
+                    fifo_score = original_hybrid_score  # hybrid_score = fifo_score when beta=0
+                    selected_focus_scores.append(focus_score)
+                    selected_fifo_scores.append(fifo_score)
+                    selected_hybrid_scores.append(original_hybrid_score)
+        else:
+            # Normal case where both focus and FIFO scores exist
+            for (user_msg_id, assistant_msg_id), original_hybrid_score in pair_hybrid_scores.items():
+                if user_msg_id in message_ids_to_remove_set and assistant_msg_id in message_ids_to_remove_set:
+                    focus_score = pair_focus_scores.get((user_msg_id, assistant_msg_id), 0.0)
+                    fifo_score = pair_fifo_scores.get((user_msg_id, assistant_msg_id), 0.0)
+                    selected_focus_scores.append(focus_score)
+                    selected_fifo_scores.append(fifo_score)
+                    selected_hybrid_scores.append(original_hybrid_score)
+                    # print(f"  Pair (User: {user_msg_id}, Asst: {assistant_msg_id}): Focus={focus_score:.4f}, FIFO={fifo_score:.4f}, Hybrid={original_hybrid_score:.4f}")
         
         print(f"\nHybrid Score Formula Used: Focus * {self.beta} + FIFO * {1.0 - self.beta}")
         if selected_hybrid_scores:
@@ -1618,7 +1676,7 @@ class Agent(object):
 
         # Step 8: Create summary message
         num_original_messages_summarized = len(actual_messages_for_summarizer_chronological)
-        summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} messages using combined FIFO and focus-based pair selection]:\n{summary_text}"
+        summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} messages using combined FIFO and focus-based pair selection]:\n{summary_text}\n\n[Note: Please respond normally to any questions that follow. The above is background context from previous conversation.]"
 
         summary_message_to_prepend = Message.dict_to_message(
             agent_id=self.agent_state.id,
@@ -1764,9 +1822,9 @@ class Agent(object):
                 message_sequence_to_summarize=actual_messages
             )
         
-        print(f"Cluster-based summarization: Found {len(clusters)} clusters")
-        for cluster_id, msgs in clusters.items():
-            print(f"  Cluster {cluster_id}: {len(msgs)} messages, {cluster_tokens[cluster_id]} tokens")
+        # print(f"Cluster-based summarization: Found {len(clusters)} clusters")
+        # for cluster_id, msgs in clusters.items():
+        #     print(f"  Cluster {cluster_id}: {len(msgs)} messages, {cluster_tokens[cluster_id]} tokens")
         
         # Generate summary for each cluster
         cluster_summaries = []
@@ -1781,7 +1839,7 @@ class Agent(object):
             cluster_messages_sorted = sorted(cluster_messages, key=lambda x: self._messages.index(x))
             cluster_messages_dicts = [msg.to_openai_dict() for msg in cluster_messages_sorted]
             
-            print(f"Cluster-based summarization: Summarizing cluster {cluster_id} with {len(cluster_messages_dicts)} messages...")
+            # print(f"Cluster-based summarization: Summarizing cluster {cluster_id} with {len(cluster_messages_dicts)} messages...")
             
             try:
                 cluster_summary = summarize_messages(
@@ -1804,6 +1862,502 @@ class Agent(object):
         
         print(f"Cluster-based summarization: Generated combined summary with {len(cluster_summaries)} topic clusters")
         return combined_summary
+
+    def summarize_messages_pure_cluster_inplace(self):
+        """Pure cluster-based summarization that groups all messages by similarity.
+        
+        Creates embeddings for all message pairs, runs unsupervised clustering,
+        and creates a summary for each cluster that gets appended to context.
+        """
+        print("PURE CLUSTER MODE: Summarizing messages using pure clustering approach.")
+        if not self._messages or len(self._messages) <= 1:  # Must have more than system message
+            raise LLMError("Pure cluster summarize error: Not enough messages to process for summarization.")
+
+        # Ensure context window is known
+        if self.agent_state.llm_config.context_window is None:
+            print(f"{CLI_WARNING_PREFIX}Pure cluster summarize: context_window missing in agent config, setting to default.")
+            self.agent_state.llm_config.context_window = (
+                LLM_MAX_TOKENS.get(self.model, LLM_MAX_TOKENS["DEFAULT"])
+            )
+        context_window = int(self.agent_state.llm_config.context_window)
+        if self.max_tokens is not None:
+            target_token_count = self.max_tokens
+            print(f"Pure cluster summarize: Using custom max_tokens target: {target_token_count}")
+        else:
+            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+            print(f"Pure cluster summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
+
+        # Calculate current total tokens from self._messages
+        current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Pure cluster summarize: Current tokens: {current_total_tokens}, Target tokens after summarization: {target_token_count}")
+
+        tokens_to_free = current_total_tokens - target_token_count
+        if tokens_to_free <= 0:
+            print(f"Pure cluster summarize: No tokens need to be freed (current: {current_total_tokens}, target: {target_token_count}). Skipping summarization.")
+            self.agent_alerted_about_memory_pressure = False
+            return
+
+        print(f"Pure cluster summarize: Need to free approximately {tokens_to_free} tokens.")
+
+        # Step 1: Generate message pair embeddings
+        print("Pure cluster summarize: Generating embeddings for all message pairs...")
+        try:
+            message_pair_embeddings_with_ids = self._create_robust_message_pair_embeddings(
+                message_sequence=self._messages, 
+                embedding_config=self.agent_state.embedding_config
+            )
+            if not message_pair_embeddings_with_ids:
+                print("Pure cluster summarize: No message pair embeddings generated. Falling back to FIFO mode.")
+                self.summarize_messages_inplace()
+                return
+        except Exception as emb_e:
+            print(f"Pure cluster summarize: Error generating embeddings: {emb_e}. Falling back to FIFO mode.")
+            self.summarize_messages_inplace()
+            return
+
+        # Step 2: Run clustering on all messages
+        print("Pure cluster summarize: Running unsupervised clustering on all message pairs...")
+        try:
+            cluster_assignments = self.cluster_messages_for_summarization(message_pair_embeddings_with_ids)
+        except Exception as cluster_e:
+            print(f"Pure cluster summarize: Clustering failed ({cluster_e}), falling back to FIFO mode")
+            self.summarize_messages_inplace()
+            return
+
+        # Step 3: Preserve last N messages
+        message_id_to_message_obj = {msg.id: msg for msg in self._messages if msg.id is not None}
+        ids_to_preserve = set()
+        if MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST > 0:
+            relevant_messages_for_preservation = [m for m in self._messages if m.role != "system"]
+            if len(relevant_messages_for_preservation) > MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST:
+                for i in range(1, MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST + 1):
+                    if relevant_messages_for_preservation[-i].id:
+                        ids_to_preserve.add(relevant_messages_for_preservation[-i].id)
+
+        # Step 4: Group all eligible messages by cluster (excluding preserved messages)
+        cluster_to_messages = {}
+        message_ids_to_remove_set = set()
+        
+        for msg in self._messages:
+            if msg.id is None or msg.role == "system" or msg.id in ids_to_preserve:
+                continue
+                
+            if msg.id in cluster_assignments:
+                cluster_id = cluster_assignments[msg.id]
+                if cluster_id not in cluster_to_messages:
+                    cluster_to_messages[cluster_id] = []
+                cluster_to_messages[cluster_id].append(msg)
+                message_ids_to_remove_set.add(msg.id)
+
+        if not cluster_to_messages:
+            print(f"{CLI_WARNING_PREFIX}Pure cluster summarize: No messages assigned to clusters for summarization.")
+            raise LLMError("Pure cluster summarize: Failed to assign any messages to clusters for summarization.")
+
+        print(f"Pure cluster summarize: Grouped {len(message_ids_to_remove_set)} messages into {len(cluster_to_messages)} clusters")
+
+        # Step 5: Create cluster summaries
+        cluster_summaries = []
+        for cluster_id in sorted(cluster_to_messages.keys()):
+            cluster_messages = cluster_to_messages[cluster_id]
+            if not cluster_messages:
+                continue
+                
+            # Convert to chronological order
+            cluster_messages_sorted = sorted(cluster_messages, key=lambda x: self._messages.index(x))
+            cluster_messages_dicts = [msg.to_openai_dict() for msg in cluster_messages_sorted]
+            
+            print(f"Pure cluster summarize: Creating summary for cluster {cluster_id} with {len(cluster_messages_dicts)} messages...")
+            
+            try:
+                cluster_summary = summarize_messages(
+                    agent_state=self.agent_state,
+                    message_sequence_to_summarize=cluster_messages_dicts
+                )
+                total_cluster_tokens = sum(count_tokens(str(msg)) for msg in cluster_messages_dicts)
+                cluster_summaries.append(f"Topic Cluster {cluster_id} ({len(cluster_messages_dicts)} messages, {total_cluster_tokens} tokens): {cluster_summary}")
+                
+            except Exception as e:
+                print(f"Pure cluster summarize: Error summarizing cluster {cluster_id}: {e}")
+                # Create a simple fallback summary
+                cluster_summaries.append(f"Topic Cluster {cluster_id}: Contains {len(cluster_messages_dicts)} messages [summarization failed: {str(e)}]")
+
+        # Step 6: Create combined summary message
+        if len(cluster_summaries) == 1:
+            combined_summary = cluster_summaries[0]
+        else:
+            combined_summary = "Multi-topic cluster summary:\n" + "\n\n".join(cluster_summaries)
+        
+        num_original_messages_summarized = len(message_ids_to_remove_set)
+        summary_insert_content = f"[Pure Cluster Summary: condensed {num_original_messages_summarized} messages into {len(cluster_summaries)} topic clusters]:\n{combined_summary}\n\n[Note: Please respond normally to any questions that follow. The above is background context from previous conversation.]"
+
+        summary_message_to_prepend = Message.dict_to_message(
+            agent_id=self.agent_state.id,
+            user_id=self.agent_state.user_id,
+            model=self.model, 
+            openai_message_dict={"role": "user", "content": summary_insert_content}
+        )
+
+        # Step 7: Remove clustered messages and add summary
+        original_message_count = len(self._messages)
+        new_messages_list = [msg for msg in self._messages if msg.id not in message_ids_to_remove_set]
+
+        # Clean up persistence manager
+        if isinstance(self.persistence_manager, LocalStateManager):
+            deleted_count_pm = 0
+            for msg_id_to_delete in message_ids_to_remove_set:
+                try:
+                    if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
+                        self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
+                        deleted_count_pm += 1
+                except Exception as del_e:
+                    print(f"{CLI_WARNING_PREFIX}Pure cluster summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
+            print(f"Pure cluster summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
+
+        self._messages = new_messages_list
+        self._prepend_to_messages([summary_message_to_prepend])
+        self.agent_alerted_about_memory_pressure = False
+
+        final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Pure cluster summarize: Completed. Original messages: {original_message_count}, New messages: {len(self._messages)}. Original tokens: {current_total_tokens}, Final tokens: {final_token_count}.")
+
+    def summarize_messages_density_inplace(self):
+        """Density-based clustering summarization with hybrid FIFO weighting.
+        
+        Creates embeddings for all message pairs, runs clustering, but only
+        summarizes clusters with the highest densities. Uses beta parameter
+        to combine with FIFO approach.
+        """
+        print("DENSITY MODE: Summarizing messages using density-based clustering with hybrid FIFO weighting.")
+        if not self._messages or len(self._messages) <= 1:  # Must have more than system message
+            raise LLMError("Density summarize error: Not enough messages to process for summarization.")
+
+        # Ensure context window is known
+        if self.agent_state.llm_config.context_window is None:
+            print(f"{CLI_WARNING_PREFIX}Density summarize: context_window missing in agent config, setting to default.")
+            self.agent_state.llm_config.context_window = (
+                LLM_MAX_TOKENS.get(self.model, LLM_MAX_TOKENS["DEFAULT"])
+            )
+        context_window = int(self.agent_state.llm_config.context_window)
+        if self.max_tokens is not None:
+            target_token_count = self.max_tokens
+            print(f"Density summarize: Using custom max_tokens target: {target_token_count}")
+        else:
+            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
+            print(f"Density summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
+
+        # Calculate current total tokens from self._messages
+        current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Density summarize: Current tokens: {current_total_tokens}, Target tokens after summarization: {target_token_count}")
+
+        tokens_to_free = current_total_tokens - target_token_count
+        if tokens_to_free <= 0:
+            print(f"Density summarize: No tokens need to be freed (current: {current_total_tokens}, target: {target_token_count}). Skipping summarization.")
+            self.agent_alerted_about_memory_pressure = False
+            return
+
+        print(f"Density summarize: Need to free approximately {tokens_to_free} tokens. Beta={self.beta}")
+
+        # OPTIMIZATION: If beta=0, skip embeddings and use pure FIFO mode
+        if self.beta == 0.0:
+            print("Density summarize: Beta=0 detected, skipping expensive embedding computation and clustering, using pure FIFO approach.")
+            
+            # Create message pairs without embeddings, just user-assistant sequence pairs
+            message_pairs_without_embeddings = []
+            for i in range(len(self._messages) - 1):
+                msg1 = self._messages[i]
+                msg2 = self._messages[i+1]
+                if msg1.role == "user" and msg2.role == "assistant" and msg1.id is not None and msg2.id is not None:
+                    message_pairs_without_embeddings.append((msg1.id, msg2.id))
+            
+            if not message_pairs_without_embeddings:
+                print("Density summarize: No user-assistant message pairs found. Falling back to regular FIFO mode.")
+                self.summarize_messages_inplace()
+                return
+                
+            print(f"Density summarize: Found {len(message_pairs_without_embeddings)} user-assistant pairs for FIFO processing")
+            
+            # Create only FIFO scores (no density scores needed when beta=0)
+            pair_hybrid_scores = {}
+            message_id_to_position = {msg.id: idx for idx, msg in enumerate(self._messages)}
+            max_position = len(self._messages) - 1
+            
+            for user_msg_id, assistant_msg_id in message_pairs_without_embeddings:
+                user_pos = message_id_to_position.get(user_msg_id, 0)
+                asst_pos = message_id_to_position.get(assistant_msg_id, 0)
+                avg_position = (user_pos + asst_pos) / 2.0
+                
+                # Pure FIFO score: older messages (lower position) get higher scores for removal
+                if max_position > 0:
+                    fifo_score = (max_position - avg_position) / max_position
+                else:
+                    fifo_score = 0.0
+                
+                fifo_score = max(0.0, min(1.0, fifo_score))
+                
+                # Since beta=0: hybrid_score = density_component * 0 + fifo_component * 1 = fifo_score
+                pair_hybrid_scores[(user_msg_id, assistant_msg_id)] = fifo_score
+            
+            # Set message_id_to_message_obj for the selection logic that follows
+            message_id_to_message_obj = {msg.id: msg for msg in self._messages if msg.id is not None}
+
+        else:
+            # Beta > 0, proceed with full density approach including embeddings and clustering
+            # Step 1: Generate message pair embeddings
+            print("Density summarize: Generating embeddings for all message pairs...")
+            try:
+                message_pair_embeddings_with_ids = self._create_robust_message_pair_embeddings(
+                    message_sequence=self._messages, 
+                    embedding_config=self.agent_state.embedding_config
+                )
+                if not message_pair_embeddings_with_ids:
+                    print("Density summarize: No message pair embeddings generated. Falling back to FIFO mode.")
+                    self.summarize_messages_inplace()
+                    return
+            except Exception as emb_e:
+                print(f"Density summarize: Error generating embeddings: {emb_e}. Falling back to FIFO mode.")
+                self.summarize_messages_inplace()
+                return
+
+            # Step 2: Run clustering on all messages
+            print("Density summarize: Running unsupervised clustering on all message pairs...")
+            try:
+                cluster_assignments = self.cluster_messages_for_summarization(message_pair_embeddings_with_ids)
+            except Exception as cluster_e:
+                print(f"Density summarize: Clustering failed ({cluster_e}), falling back to FIFO mode")
+                self.summarize_messages_inplace()
+                return
+
+            # Step 3: Calculate cluster densities
+            embeddings_by_cluster = {}
+            for i, (user_id, assistant_id, embedding) in enumerate(message_pair_embeddings_with_ids):
+                if user_id in cluster_assignments:
+                    cluster_id = cluster_assignments[user_id]
+                    if cluster_id not in embeddings_by_cluster:
+                        embeddings_by_cluster[cluster_id] = []
+                    embeddings_by_cluster[cluster_id].append(embedding)
+
+            cluster_densities = {}
+            for cluster_id, embeddings in embeddings_by_cluster.items():
+                if len(embeddings) < 2:
+                    cluster_densities[cluster_id] = 0.0
+                    continue
+                    
+                # Calculate average pairwise distance within cluster (lower = denser)
+                embeddings_np = np.array(embeddings)
+                distances = []
+                for i in range(len(embeddings_np)):
+                    for j in range(i + 1, len(embeddings_np)):
+                        dist = np.linalg.norm(embeddings_np[i] - embeddings_np[j])
+                        distances.append(dist)
+                
+                # Density is inverse of average distance (higher density = lower average distance)
+                avg_distance = np.mean(distances) if distances else 1.0
+                cluster_densities[cluster_id] = 1.0 / (avg_distance + 1e-6)  # Add small epsilon to avoid division by zero
+
+            print(f"Density summarize: Calculated densities for {len(cluster_densities)} clusters")
+            for cluster_id, density in sorted(cluster_densities.items(), key=lambda x: x[1], reverse=True):
+                print(f"  Cluster {cluster_id}: density={density:.4f}")
+
+            # Step 4: Create density scores (higher density = higher score for removal)
+            message_id_to_message_obj = {msg.id: msg for msg in self._messages if msg.id is not None}
+            pair_density_scores = {}
+            max_density = max(cluster_densities.values()) if cluster_densities else 1.0
+            
+            for user_id, assistant_id, _ in message_pair_embeddings_with_ids:
+                if user_id in cluster_assignments:
+                    cluster_id = cluster_assignments[user_id]
+                    density = cluster_densities.get(cluster_id, 0.0)
+                    # Normalize density score
+                    normalized_density = density / max_density if max_density > 0 else 0.0
+                    pair_density_scores[(user_id, assistant_id)] = normalized_density
+
+            # Step 5: Create FIFO scores (same as hybrid mode)
+            pair_fifo_scores = {}
+            message_id_to_position = {msg.id: idx for idx, msg in enumerate(self._messages)}
+            max_position = len(self._messages) - 1
+            
+            for user_msg_id, assistant_msg_id, _ in message_pair_embeddings_with_ids:
+                user_pos = message_id_to_position.get(user_msg_id, 0)
+                asst_pos = message_id_to_position.get(assistant_msg_id, 0)
+                avg_position = (user_pos + asst_pos) / 2.0
+                
+                if max_position > 0:
+                    fifo_score = (max_position - avg_position) / max_position
+                else:
+                    fifo_score = 0.0
+                
+                fifo_score = max(0.0, min(1.0, fifo_score))
+                pair_fifo_scores[(user_msg_id, assistant_msg_id)] = fifo_score
+
+            # Step 6: Combine density and FIFO scores using beta weighting
+            pair_hybrid_scores = {}
+            for pair_key in pair_density_scores.keys():
+                density_component = pair_density_scores.get(pair_key, 0.0) * self.beta
+                fifo_component = pair_fifo_scores.get(pair_key, 0.0) * (1.0 - self.beta)
+                pair_hybrid_scores[pair_key] = density_component + fifo_component
+
+        print(f"Density summarize: Generated {len(pair_hybrid_scores)} hybrid density-FIFO scores (beta={self.beta})")
+
+        # Step 7: Preserve last N messages
+        ids_to_preserve = set()
+        if MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST > 0:
+            relevant_messages_for_preservation = [m for m in self._messages if m.role != "system"]
+            if len(relevant_messages_for_preservation) > MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST:
+                for i in range(1, MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST + 1):
+                    if relevant_messages_for_preservation[-i].id:
+                        ids_to_preserve.add(relevant_messages_for_preservation[-i].id)
+
+        # Step 8: Select message pairs for removal based on hybrid scores
+        sorted_pairs_by_score = sorted(pair_hybrid_scores.items(), key=lambda x: x[1], reverse=True)
+        message_ids_to_remove_set = set()
+        tokens_freed_so_far = 0
+
+        for (user_msg_id, assistant_msg_id), hybrid_score in sorted_pairs_by_score:
+            if user_msg_id in ids_to_preserve or assistant_msg_id in ids_to_preserve:
+                continue
+            
+            if user_msg_id in message_ids_to_remove_set or assistant_msg_id in message_ids_to_remove_set:
+                continue
+
+            user_msg_obj = message_id_to_message_obj.get(user_msg_id)
+            assistant_msg_obj = message_id_to_message_obj.get(assistant_msg_id)
+
+            if not user_msg_obj or not assistant_msg_obj:
+                continue
+            
+            if user_msg_obj.role == "system" or assistant_msg_obj.role == "system":
+                continue
+
+            pair_tokens = count_tokens(str(user_msg_obj.to_openai_dict())) + count_tokens(str(assistant_msg_obj.to_openai_dict()))
+            
+            message_ids_to_remove_set.add(user_msg_id)
+            message_ids_to_remove_set.add(assistant_msg_id)
+            tokens_freed_so_far += pair_tokens
+
+            if tokens_freed_so_far >= tokens_to_free:
+                break
+
+        if not message_ids_to_remove_set:
+            print(f"{CLI_WARNING_PREFIX}Density summarize: No message pairs selected for summarization.")
+            raise LLMError("Density summarize: Failed to select any message pairs for summarization to reduce context pressure.")
+
+        # Step 9: Group selected messages by cluster for summarization (only if clustering enabled)
+        if self.cluster_summaries:
+            if self.beta == 0.0:
+                # When beta=0, no clustering was performed, so disable cluster-based summarization
+                print("Density summarize: Beta=0 detected - cluster-based summarization disabled (no clustering performed)")
+                # Fall through to regular summarization
+                actual_messages_for_summarizer_chronological = []
+                for msg_obj in self._messages:
+                    if msg_obj.id in message_ids_to_remove_set:
+                        actual_messages_for_summarizer_chronological.append(msg_obj.to_openai_dict())
+
+                if not actual_messages_for_summarizer_chronological:
+                    raise LLMError("Density summarize: Messages were marked for removal, but could not be collected for the summarizer.")
+
+                combined_summary = summarize_messages(
+                    agent_state=self.agent_state,
+                    message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+                )
+                summary_mode = f"Density (β={self.beta})"
+            else:
+                # Normal case: clustering was performed, group by clusters
+                print("Density summarize: Cluster-based summarization enabled, grouping by clusters...")
+                cluster_to_messages = {}
+                for msg_id in message_ids_to_remove_set:
+                    if msg_id in cluster_assignments:
+                        cluster_id = cluster_assignments[msg_id]
+                        if cluster_id not in cluster_to_messages:
+                            cluster_to_messages[cluster_id] = []
+                        msg_obj = message_id_to_message_obj.get(msg_id)
+                        if msg_obj:
+                            cluster_to_messages[cluster_id].append(msg_obj)
+
+                # Step 10: Create cluster summaries for selected messages
+                cluster_summaries = []
+                for cluster_id in sorted(cluster_to_messages.keys()):
+                    cluster_messages = cluster_to_messages[cluster_id]
+                    if not cluster_messages:
+                        continue
+                        
+                    cluster_messages_sorted = sorted(cluster_messages, key=lambda x: self._messages.index(x))
+                    cluster_messages_dicts = [msg.to_openai_dict() for msg in cluster_messages_sorted]
+                    
+                    print(f"Density summarize: Creating summary for high-density cluster {cluster_id} with {len(cluster_messages_dicts)} messages...")
+                    
+                    try:
+                        cluster_summary = summarize_messages(
+                            agent_state=self.agent_state,
+                            message_sequence_to_summarize=cluster_messages_dicts
+                        )
+                        density = cluster_densities.get(cluster_id, 0.0)
+                        cluster_summaries.append(f"High-Density Cluster {cluster_id} (density={density:.4f}, {len(cluster_messages_dicts)} messages): {cluster_summary}")
+                        
+                    except Exception as e:
+                        print(f"Density summarize: Error summarizing cluster {cluster_id}: {e}")
+                        cluster_summaries.append(f"High-Density Cluster {cluster_id}: Contains {len(cluster_messages_dicts)} messages [summarization failed: {str(e)}]")
+
+                # Create combined cluster summary
+                if len(cluster_summaries) == 1:
+                    combined_summary = cluster_summaries[0]
+                else:
+                    combined_summary = "Multi-cluster density-based summary:\n" + "\n\n".join(cluster_summaries)
+                
+                summary_mode = f"Density+Cluster (β={self.beta})"
+            
+        else:
+            print("Density summarize: Regular summarization (clustering disabled)")
+            # Step 9 & 10: Regular summarization without clustering
+            actual_messages_for_summarizer_chronological = []
+            for msg_obj in self._messages:
+                if msg_obj.id in message_ids_to_remove_set:
+                    actual_messages_for_summarizer_chronological.append(msg_obj.to_openai_dict())
+
+            if not actual_messages_for_summarizer_chronological:
+                raise LLMError("Density summarize: Messages were marked for removal, but could not be collected for the summarizer.")
+
+            combined_summary = summarize_messages(
+                agent_state=self.agent_state,
+                message_sequence_to_summarize=actual_messages_for_summarizer_chronological
+            )
+            summary_mode = f"Density (β={self.beta})"
+
+        # Step 11: Create combined summary message
+        num_original_messages_summarized = len(message_ids_to_remove_set)
+        if self.cluster_summaries:
+            summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} messages from {len(cluster_summaries) if 'cluster_summaries' in locals() else 0} high-density clusters using β={self.beta} hybrid weighting]:\n{combined_summary}\n\n[Note: Please respond normally to any questions that follow. The above is background context from previous conversation.]"
+        else:
+            summary_insert_content = f"[{summary_mode} Summary: condensed {num_original_messages_summarized} messages using β={self.beta} density-FIFO hybrid weighting]:\n{combined_summary}\n\n[Note: Please respond normally to any questions that follow. The above is background context from previous conversation.]"
+
+        summary_message_to_prepend = Message.dict_to_message(
+            agent_id=self.agent_state.id,
+            user_id=self.agent_state.user_id,
+            model=self.model, 
+            openai_message_dict={"role": "user", "content": summary_insert_content}
+        )
+
+        # Step 12: Remove selected messages and add summary
+        original_message_count = len(self._messages)
+        new_messages_list = [msg for msg in self._messages if msg.id not in message_ids_to_remove_set]
+
+        # Clean up persistence manager
+        if isinstance(self.persistence_manager, LocalStateManager):
+            deleted_count_pm = 0
+            for msg_id_to_delete in message_ids_to_remove_set:
+                try:
+                    if self.persistence_manager.recall_memory.storage.get(id=msg_id_to_delete):
+                        self.persistence_manager.recall_memory.storage.delete(filters={"id": msg_id_to_delete})
+                        deleted_count_pm += 1
+                except Exception as del_e:
+                    print(f"{CLI_WARNING_PREFIX}Density summarize: Error deleting message {msg_id_to_delete} from persistence: {del_e}")
+            print(f"Density summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
+
+        self._messages = new_messages_list
+        self._prepend_to_messages([summary_message_to_prepend])
+        self.agent_alerted_about_memory_pressure = False
+
+        final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
+        print(f"Density summarize: Completed. Original messages: {original_message_count}, New messages: {len(self._messages)}. Original tokens: {current_total_tokens}, Final tokens: {final_token_count}.")
 
     def heartbeat_is_paused(self):
         """Check if there's a requested pause on timed heartbeats"""
