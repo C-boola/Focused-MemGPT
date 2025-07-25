@@ -1,5 +1,8 @@
 import os
 import base64
+import time
+import logging
+from typing import Dict, Optional
 from sqlalchemy import QueuePool, create_engine, Column, String, BIGINT, select, inspect, text, JSON, BLOB, BINARY, ARRAY, DateTime
 from sqlalchemy import func, or_, and_
 from sqlalchemy import desc, asc
@@ -9,6 +12,9 @@ from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy_json import mutable_json_type, MutableJson
 from sqlalchemy import TypeDecorator, CHAR
+from sqlalchemy.exc import OperationalError, DisconnectionError
+from sqlalchemy.pool import Pool
+from sqlalchemy import event
 import uuid
 
 from tqdm import tqdm
@@ -24,6 +30,87 @@ from memgpt.utils import printd
 from memgpt.data_types import Record, Message, Passage, ToolCall, RecordType
 from memgpt.constants import MAX_EMBEDDING_DIM
 from memgpt.metadata import MetadataStore
+
+# Set up logging for connection issues
+logger = logging.getLogger(__name__)
+
+# Global engine cache to prevent multiple engines for the same URI
+_engine_cache: Dict[str, any] = {}
+_engine_cache_lock = None
+
+try:
+    import threading
+    _engine_cache_lock = threading.Lock()
+except ImportError:
+    # Fallback for environments without threading
+    class DummyLock:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    _engine_cache_lock = DummyLock()
+
+
+def create_shared_engine(uri: str, **engine_kwargs):
+    """Create or return cached engine to prevent connection proliferation"""
+    with _engine_cache_lock:
+        if uri not in _engine_cache:
+            logger.info(f"Creating new shared engine for URI: {uri[:20]}...")
+            engine = create_engine(uri, **engine_kwargs)
+            
+            # Register pool events for disconnect handling
+            event.listen(engine.pool, 'invalidate', handle_db_disconnect)
+            event.listen(engine.pool, 'connect', validate_connection)
+            
+            _engine_cache[uri] = engine
+        return _engine_cache[uri]
+
+
+def handle_db_disconnect(dbapi_conn, connection_record, exception):
+    """Handle database disconnects with logging"""
+    logger.warning(f"Database connection invalidated: {exception}")
+    # Don't call invalidate here - SQLAlchemy will handle it
+
+
+def validate_connection(dbapi_connection, connection_record):
+    """Pessimistic connection validation"""
+    try:
+        # Simple validation query
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+    except Exception as e:
+        logger.warning(f"Connection validation failed: {e}")
+        raise DisconnectionError("Connection validation failed") from e
+
+
+def retry_on_connection_error(func):
+    """Decorator to retry database operations on connection errors"""
+    def wrapper(*args, **kwargs):
+        max_retries = 3
+        base_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (OperationalError, DisconnectionError) as e:
+                error_msg = str(e).lower()
+                if ("too many clients" in error_msg or 
+                    "connection" in error_msg or 
+                    "server closed the connection" in error_msg or
+                    "connection was dropped" in error_msg):
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Connection error on attempt {attempt + 1}, retrying in {delay}s: {e}")
+                        time.sleep(delay)
+                        continue
+                raise
+            except Exception as e:
+                # For non-connection errors, don't retry
+                raise
+        
+        # This should never be reached, but just in case
+        raise Exception("Max retries exceeded")
+        
+    return wrapper
 
 
 # Custom UUID type
@@ -277,6 +364,7 @@ class SQLStorageConnector(StorageConnector):
             # Increment the offset to get the next chunk in the next iteration
             offset += page_size
 
+    @retry_on_connection_error
     def get_all_cursor(
         self,
         filters: Optional[Dict] = {},
@@ -329,6 +417,7 @@ class SQLStorageConnector(StorageConnector):
         # return (cursor, list[records])
         return (next_cursor, records)
 
+    @retry_on_connection_error
     def get_all(self, filters: Optional[Dict] = {}, limit=None) -> List[RecordType]:
         filters = self.get_filters(filters)
         with self.session_maker() as session:
@@ -338,6 +427,7 @@ class SQLStorageConnector(StorageConnector):
                 db_records = session.query(self.db_model).filter(*filters).all()
         return [record.to_record() for record in db_records]
 
+    @retry_on_connection_error
     def get(self, id: uuid.UUID) -> Optional[Record]:
         with self.session_maker() as session:
             db_record = session.get(self.db_model, id)
@@ -345,6 +435,7 @@ class SQLStorageConnector(StorageConnector):
             return None
         return db_record.to_record()
 
+    @retry_on_connection_error
     def size(self, filters: Optional[Dict] = {}) -> int:
         # return size of table
         filters = self.get_filters(filters)
@@ -449,46 +540,70 @@ class PostgresStorageConnector(SQLStorageConnector):
             url = os.getenv("MEMGPT_PG_URL", "localhost")
             self.uri = f"postgresql+pg8000://{user}:{password}@{url}:{port}/{db}"
 
-        # Performance-optimized engine configuration
+        # Conservative connection pool configuration to prevent "too many clients" errors
         engine_kwargs = {
-            # Connection pooling settings
+            # Connection pooling settings - reduced defaults for better resource management
             'poolclass': QueuePool,
-            'pool_size': int(os.getenv("MEMGPT_PG_POOL_SIZE", "20")),  # Base number of connections
-            'max_overflow': int(os.getenv("MEMGPT_PG_MAX_OVERFLOW", "30")),  # Additional connections beyond pool_size
+            'pool_size': int(os.getenv("MEMGPT_PG_POOL_SIZE", "5")),  # Reduced from 20 to 5
+            'max_overflow': int(os.getenv("MEMGPT_PG_MAX_OVERFLOW", "10")),  # Reduced from 30 to 10
             'pool_timeout': int(os.getenv("MEMGPT_PG_POOL_TIMEOUT", "30")),  # Timeout for getting connection
-            'pool_recycle': int(os.getenv("MEMGPT_PG_POOL_RECYCLE", "3600")),  # Recycle connections after 1 hour
+            'pool_recycle': int(os.getenv("MEMGPT_PG_POOL_RECYCLE", "1800")),  # Recycle connections after 30 minutes
             'pool_pre_ping': True,  # Verify connections before use
             'pool_reset_on_return': 'commit',  # Reset connection state on return
             
             # Performance settings
-            'echo': False,  # Disable SQL logging for performance
-            'echo_pool': False,  # Disable pool logging
+            'echo': os.getenv("MEMGPT_PG_ECHO", "false").lower() == "true",  # Enable SQL logging if needed
+            'echo_pool': os.getenv("MEMGPT_PG_ECHO_POOL", "false").lower() == "true",  # Enable pool logging if needed
             'future': True,  # Use SQLAlchemy 2.0 style
             
-            # Connection settings
-            # 'connect_args': {
-            #     'command_timeout': 60,
-            #     'server_settings': {
-            #         'jit': 'off',  # Disable JIT for better performance on short queries
-            #         'application_name': 'memgpt_connector',
-            #     }
-            # }
+            # Connection settings with application name for easier debugging
+            'connect_args': {
+                'application_name': f'memgpt_{table_type}_{user_id}',
+            }
         }
 
         # create engine
-        self.engine = create_engine(self.uri, **engine_kwargs)
+        self.engine = create_shared_engine(self.uri, **engine_kwargs)
 
         for c in self.db_model.__table__.columns:
             if c.name == "embedding":
                 assert isinstance(c.type, Vector), f"Embedding column must be of type Vector, got {c.type}"
 
         self.session_maker = sessionmaker(bind=self.engine)
+        
+        # Initialize database with retry logic
+        self._initialize_database()
+
+    @retry_on_connection_error
+    def _initialize_database(self):
+        """Initialize database with vector extension and tables"""
         with self.session_maker() as session:
             session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))  # Enables the vector extension
+            session.commit()
 
         # create table
         Base.metadata.create_all(self.engine, tables=[self.db_model.__table__])  # Create the table if it doesn't exist
 
+    def get_pool_status(self):
+        """Get current connection pool status for debugging"""
+        pool = self.engine.pool
+        try:
+            return {
+                'size': pool.size(),
+                'checked_in': pool.checkedin(),
+                'checked_out': pool.checkedout(),
+                'total': pool.size() + pool.checkedout(),
+                'overflow': getattr(pool, '_overflow', 0),
+                'max_overflow': getattr(pool, '_max_overflow', 0),
+            }
+        except AttributeError as e:
+            logger.warning(f"Could not get complete pool status: {e}")
+            return {
+                'error': f"Pool status unavailable: {e}",
+                'pool_class': type(pool).__name__
+            }
+
+    @retry_on_connection_error
     def query(self, query: str, query_vec: List[float], top_k: int = 10, filters: Optional[Dict] = {}) -> List[RecordType]:
         filters = self.get_filters(filters)
         with self.session_maker() as session:
@@ -500,6 +615,7 @@ class PostgresStorageConnector(SQLStorageConnector):
         records = [result.to_record() for result in results]
         return records
 
+    @retry_on_connection_error
     def insert_many(self, records: List[RecordType], exists_ok=True, show_progress=False):
         from sqlalchemy.dialects.postgresql import insert
 
@@ -528,9 +644,11 @@ class PostgresStorageConnector(SQLStorageConnector):
                     session.add(db_record)
                 session.commit()
 
+    @retry_on_connection_error
     def insert(self, record: Record, exists_ok=True):
         self.insert_many([record], exists_ok=exists_ok)
 
+    @retry_on_connection_error
     def update(self, record: RecordType):
         """
         Updates a record in the database based on the provided Record object.
