@@ -6,6 +6,8 @@ import time
 import sys
 import traceback
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # --- Debug Logging Utility ---
 # Set DEBUG to True to see detailed step-by-step logs.
@@ -188,7 +190,10 @@ def run_test_instance(
         }
     }
 
-    for i, chunk in enumerate(tqdm(text_chunks, desc="Extracting facts from history")):
+    # Define a function to process a single chunk in parallel
+    def process_chunk(chunk_data):
+        """Process a single chunk and return extracted facts."""
+        chunk_index, chunk = chunk_data
         try:
             extraction_prompt = f"""Analyze the following conversation text and extract two types of facts:
 1. **core_facts**: Permanent, foundational facts about the user's identity, personality, or stated long-term goals.
@@ -203,7 +208,7 @@ Conversation Text:
             
             messages = [{"role": "user", "content": extraction_prompt}]
 
-            # Initialize the OpenAI client
+            # Initialize the OpenAI client (thread-safe)
             credentials = MemGPTCredentials.load()
             client = openai.OpenAI(api_key=credentials.openai_key)
 
@@ -218,38 +223,149 @@ Conversation Text:
             if response.choices[0].message.tool_calls:
                 tool_call = response.choices[0].message.tool_calls[0]
                 args = json.loads(tool_call.function.arguments)
-                
-                # Manually call the agent's memory functions
-                if args.get("core_facts"):
-                    for fact in args["core_facts"]:
-                        try:
-                            log_debug(f"Attempting to save to Core Memory: {fact}")
-                            agent.memory.edit_append('human', fact)
-                            log_debug(f"Successfully saved to Core Memory.")
-                        except ValueError as e:
-                            # This is the CORE-TO-ARCHIVAL FALLBACK logic
-                            if "exceeds character limit" in str(e).lower():
-                                log_debug(f"Core Memory full. Rerouting to Archival Memory: {fact}")
-                                try:
-                                    agent.persistence_manager.archival_memory.insert(fact)
-                                    log_debug(f"Successfully saved to Archival Memory as fallback.")
-                                except Exception as arch_e:
-                                    log_debug(f"Warning: Archival memory fallback failed: {arch_e}")
-                            else:
-                                log_debug(f"Warning: Core memory append failed with a non-size error: {e}")
-                        except Exception as e:
-                            log_debug(f"Warning: An unexpected error occurred during core memory append: {e}")
-                
-                if args.get("archivable_facts"):
-                    for fact in args["archivable_facts"]:
-                        try:
-                            log_debug(f"Saving to Archival Memory: {fact}")
-                            agent.persistence_manager.archival_memory.insert(fact)
-                        except Exception as e:
-                            log_debug(f"Warning: Archival memory insert failed: {e}")
+                return {
+                    "chunk_index": chunk_index,
+                    "core_facts": args.get("core_facts", []),
+                    "archivable_facts": args.get("archivable_facts", []),
+                    "success": True
+                }
+            else:
+                return {
+                    "chunk_index": chunk_index,
+                    "core_facts": [],
+                    "archivable_facts": [],
+                    "success": False,
+                    "error": "No tool calls in response"
+                }
             
         except Exception as e:
-            log_debug(f"Warning: Ignoring non-critical error during fact extraction on chunk {i+1}: {e}")
+            return {
+                "chunk_index": chunk_index,
+                "core_facts": [],
+                "archivable_facts": [],
+                "success": False,
+                "error": str(e)
+            }
+
+    # Process chunks in parallel with ThreadPoolExecutor
+    log_debug(f"Processing {len(text_chunks)} chunks in parallel for faster fact extraction...")
+    max_workers = min(8, len(text_chunks))  # Limit concurrent requests to avoid rate limits
+    chunk_results = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all chunk processing tasks
+        chunk_data = [(i, chunk) for i, chunk in enumerate(text_chunks)]
+        future_to_chunk = {executor.submit(process_chunk, data): data for data in chunk_data}
+        
+        # Collect results as they complete with progress bar
+        for future in tqdm(as_completed(future_to_chunk), total=len(text_chunks), desc="Extracting facts from history"):
+            result = future.result()
+            chunk_results.append(result)
+            
+            if not result["success"]:
+                log_debug(f"Warning: Failed to extract facts from chunk {result['chunk_index']}: {result.get('error', 'Unknown error')}")
+
+    # Sort results by chunk index to maintain order
+    chunk_results.sort(key=lambda x: x["chunk_index"])
+    
+    # Collect all facts for parallel memory saving
+    log_debug("Preparing facts for parallel memory saving...")
+    all_core_facts = []
+    all_archivable_facts = []
+    
+    for result in chunk_results:
+        if result["success"]:
+            all_core_facts.extend(result["core_facts"])
+            all_archivable_facts.extend(result["archivable_facts"])
+    
+    # Thread-safe memory saving with locks
+    core_memory_lock = threading.Lock()
+    archival_memory_lock = threading.Lock()
+    core_memory_full = threading.Event()  # Signal when core memory is full
+    memory_stats = {"core_saved": 0, "archival_saved": 0, "core_fallback": 0, "errors": 0}
+    stats_lock = threading.Lock()
+    
+    def save_core_fact(fact):
+        """Thread-safe core memory saving with fallback logic."""
+        try:
+            with core_memory_lock:
+                # Check if core memory was already flagged as full
+                if core_memory_full.is_set():
+                    log_debug(f"Core Memory already full, routing directly to Archival: {fact}")
+                    save_to_archival_fallback(fact)
+                    return
+                
+                try:
+                    log_debug(f"Attempting to save to Core Memory: {fact}")
+                    agent.memory.edit_append('human', fact)
+                    log_debug(f"Successfully saved to Core Memory.")
+                    with stats_lock:
+                        memory_stats["core_saved"] += 1
+                except ValueError as e:
+                    if "exceeds character limit" in str(e).lower():
+                        log_debug(f"Core Memory full detected. Setting flag and routing to Archival: {fact}")
+                        core_memory_full.set()  # Signal that core memory is full
+                        save_to_archival_fallback(fact)
+                    else:
+                        log_debug(f"Warning: Core memory append failed with non-size error: {e}")
+                        with stats_lock:
+                            memory_stats["errors"] += 1
+        except Exception as e:
+            log_debug(f"Warning: Unexpected error during core memory save: {e}")
+            with stats_lock:
+                memory_stats["errors"] += 1
+    
+    def save_to_archival_fallback(fact):
+        """Save fact to archival memory as fallback from core memory."""
+        try:
+            with archival_memory_lock:
+                agent.persistence_manager.archival_memory.insert(fact)
+                log_debug(f"Successfully saved to Archival Memory as fallback.")
+                with stats_lock:
+                    memory_stats["core_fallback"] += 1
+        except Exception as e:
+            log_debug(f"Warning: Archival memory fallback failed: {e}")
+            with stats_lock:
+                memory_stats["errors"] += 1
+    
+    def save_archival_fact(fact):
+        """Thread-safe archival memory saving."""
+        try:
+            with archival_memory_lock:
+                log_debug(f"Saving to Archival Memory: {fact}")
+                agent.persistence_manager.archival_memory.insert(fact)
+                with stats_lock:
+                    memory_stats["archival_saved"] += 1
+        except Exception as e:
+            log_debug(f"Warning: Archival memory insert failed: {e}")
+            with stats_lock:
+                memory_stats["errors"] += 1
+    
+    # Phase 1: Save core facts in parallel (with intelligent fallback)
+    if all_core_facts:
+        log_debug(f"Saving {len(all_core_facts)} core facts in parallel...")
+        with ThreadPoolExecutor(max_workers=4) as executor:  # Smaller pool for memory ops
+            core_futures = [executor.submit(save_core_fact, fact) for fact in all_core_facts]
+            for future in tqdm(as_completed(core_futures), total=len(all_core_facts), desc="Saving core facts"):
+                future.result()  # Wait for completion and handle any exceptions
+    
+    # Phase 2: Save archival facts in parallel
+    if all_archivable_facts:
+        log_debug(f"Saving {len(all_archivable_facts)} archival facts in parallel...")
+        with ThreadPoolExecutor(max_workers=4) as executor:  # Smaller pool for memory ops
+            archival_futures = [executor.submit(save_archival_fact, fact) for fact in all_archivable_facts]
+            for future in tqdm(as_completed(archival_futures), total=len(all_archivable_facts), desc="Saving archival facts"):
+                future.result()  # Wait for completion and handle any exceptions
+    
+    # Report final statistics
+    log_debug(f"Parallel memory saving complete:")
+    log_debug(f"  Core facts saved: {memory_stats['core_saved']}")
+    log_debug(f"  Archival facts saved: {memory_stats['archival_saved']}")
+    log_debug(f"  Core->Archival fallbacks: {memory_stats['core_fallback']}")
+    log_debug(f"  Errors encountered: {memory_stats['errors']}")
+    
+    total_saved = memory_stats['core_saved'] + memory_stats['archival_saved'] + memory_stats['core_fallback']
+    log_debug(f"Total facts successfully saved: {total_saved}/{len(all_core_facts) + len(all_archivable_facts)}")
 
     log_debug("===== DIRECT MEMORY POPULATION COMPLETE =====\n")
 
