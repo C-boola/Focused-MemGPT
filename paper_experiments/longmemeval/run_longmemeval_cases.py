@@ -96,7 +96,7 @@ def run_single_test_case(args_tuple):
     Takes a tuple of arguments to work with multiprocessing.
     """
     (test_case, config_dict, memory_mode, beta, cluster_summaries, 
-     prompt_type, centroid_method, score_mode, worker_id) = args_tuple
+     prompt_type, centroid_method, score_mode, worker_id, trunc_frac) = args_tuple
     
     q_id = test_case['question_id']
     
@@ -107,7 +107,7 @@ def run_single_test_case(args_tuple):
         # Run the test instance
         hypothesis = run_test_instance_worker(
             config, test_case, memory_mode, beta, cluster_summaries,
-            prompt_type, centroid_method, score_mode, worker_id
+            prompt_type, centroid_method, score_mode, worker_id, trunc_frac
         )
         
         result = {
@@ -141,7 +141,7 @@ def run_single_test_case(args_tuple):
 def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_mode: str = "focus", 
                            beta: float = 0.5, cluster_summaries: bool = False, 
                            prompt_type: str = "memgpt_default", centroid_method: str = "centroid", 
-                           score_mode: str = None, worker_id: int = 0) -> str:
+                           score_mode: str = None, worker_id: int = 0, trunc_frac: float = 0.75) -> str:
     """
     Worker version of run_test_instance that runs in a separate process.
     Streamlined for parallel execution.
@@ -187,7 +187,8 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
             beta=beta, 
             cluster_summaries=cluster_summaries, 
             centroid_method=centroid_method, 
-            score_mode=score_mode
+            score_mode=score_mode,
+            trunc_frac=trunc_frac
         )
     except Exception as e:
         return f"ERROR: AGENT_INSTANTIATION_FAILED FOR {q_id}: {e}"
@@ -377,7 +378,8 @@ def main():
     # Set the global truncation fraction constant
     import memgpt.constants
     memgpt.constants.MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC = args.trunc_frac
-    print(f"Set MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC to {args.trunc_frac}")
+    memgpt.constants.MESSAGE_SUMMARY_WARNING_FRAC = args.trunc_frac
+    print(f"Set MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC to {args.trunc_frac} and MESSAGE_SUMMARY_WARNING_FRAC to {args.trunc_frac}")
     
     print(f"Configuration:")
     print(f"  Memory mode: {args.mode.upper()}")
@@ -484,7 +486,7 @@ def main():
         worker_id = i % args.max_workers
         args_tuple = (
             test_case, config_dict, args.mode, args.beta, cluster_bool,
-            args.prompt_type, args.centroid_method, args.score_mode, worker_id
+            args.prompt_type, args.centroid_method, args.score_mode, worker_id, args.trunc_frac
         )
         worker_args.append(args_tuple)
     

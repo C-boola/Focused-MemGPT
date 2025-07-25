@@ -38,8 +38,8 @@ from memgpt.utils import (
 from memgpt.constants import (
     FIRST_MESSAGE_ATTEMPTS,
     JSON_LOADS_STRICT,
-    MESSAGE_SUMMARY_WARNING_FRAC,
-    MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC,
+    # MESSAGE_SUMMARY_WARNING_FRAC,
+    # MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC,
     MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST,
     CORE_MEMORY_HUMAN_CHAR_LIMIT,
     CORE_MEMORY_PERSONA_CHAR_LIMIT,
@@ -279,7 +279,9 @@ class Agent(object):
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
+        trunc_frac: Optional[float] = 0.75,  # new parameter to control truncation fraction
     ):
+        self.trunc_frac = trunc_frac
         # Validate beta parameter
         if beta is not None and (beta < 0.0 or beta > 1.0):
             raise ValueError(f"Beta parameter must be between 0.0 and 1.0, got {beta}")
@@ -572,9 +574,9 @@ class Agent(object):
             response = create(
                 agent_state=self.agent_state,
                 messages=message_sequence,
-                functions=self.functions,
-                functions_python=self.functions_python,
-                function_call=function_call,
+                # functions=self.functions,
+                # functions_python=self.functions_python,
+                # function_call=function_call,
                 # hint
                 first_message=first_message,
             )
@@ -924,9 +926,9 @@ class Agent(object):
                 self.agent_state.llm_config.context_window = (
                     LLM_MAX_TOKENS[self.model] if (self.model is not None and self.model in LLM_MAX_TOKENS) else LLM_MAX_TOKENS["DEFAULT"]
                 )
-            if current_total_tokens > MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window):
+            if current_total_tokens > self.trunc_frac * int(self.agent_state.llm_config.context_window):
                 printd(
-                    f"{CLI_WARNING_PREFIX}last response total_tokens ({current_total_tokens}) > {MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window)}"
+                    f"{CLI_WARNING_PREFIX}last response total_tokens ({current_total_tokens}) > {self.trunc_frac * int(self.agent_state.llm_config.context_window)}"
                 )
                 # Only deliver the alert if we haven't already (this period)
                 if not self.agent_alerted_about_memory_pressure:
@@ -934,7 +936,7 @@ class Agent(object):
                     self.agent_alerted_about_memory_pressure = True  # it's up to the outer loop to handle this
             else:
                 printd(
-                    f"last response total_tokens ({current_total_tokens}) < {MESSAGE_SUMMARY_WARNING_FRAC * int(self.agent_state.llm_config.context_window)}"
+                    f"last response total_tokens ({current_total_tokens}) < {self.trunc_frac * int(self.agent_state.llm_config.context_window)}"
                 )
 
             self._append_to_messages(all_new_messages)
@@ -1197,8 +1199,8 @@ class Agent(object):
             print(f"FIFO summarize: Current total tokens: {current_total_tokens}, need to summarize: {desired_token_count_to_summarize}")
         else:
             # Use the original fraction-based approach
-            desired_token_count_to_summarize = int(message_buffer_token_count * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
-            print(f"FIFO summarize: Using fraction-based approach: summarizing {desired_token_count_to_summarize} tokens ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {message_buffer_token_count})")
+            desired_token_count_to_summarize = int(message_buffer_token_count * self.trunc_frac)
+            print(f"FIFO summarize: Using fraction-based approach: summarizing {desired_token_count_to_summarize} tokens ({self.trunc_frac} * {message_buffer_token_count})")
         candidate_messages_to_summarize = self.messages[1:]
         token_counts = token_counts[1:]
 
@@ -1215,7 +1217,7 @@ class Agent(object):
         #         else:
         #             break
 
-        printd(f"MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC={MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC}")
+        printd(f"MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC={self.trunc_frac}")
         printd(f"MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST={MESSAGE_SUMMARY_TRUNC_KEEP_N_LAST}")
         printd(f"token_counts={token_counts}")
         printd(f"message_buffer_token_count={message_buffer_token_count}")
@@ -1338,8 +1340,8 @@ class Agent(object):
             target_token_count = self.max_tokens
             print(f"Focus summarize: Using custom max_tokens target: {target_token_count}")
         else:
-            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
-            print(f"Focus summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
+            target_token_count = int(context_window * self.trunc_frac)
+            print(f"Focus summarize: Using fraction-based target: {target_token_count} ({self.trunc_frac} * {context_window})")
 
         # Calculate current total tokens from self._messages
         current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -1534,8 +1536,8 @@ class Agent(object):
             target_token_count = self.max_tokens
             print(f"Hybrid summarize: Using custom max_tokens target: {target_token_count}")
         else:
-            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
-            print(f"Hybrid summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
+            target_token_count = int(context_window * self.trunc_frac)
+            print(f"Hybrid summarize: Using fraction-based target: {target_token_count} ({self.trunc_frac} * {context_window})")
 
         # Calculate current total tokens from self._messages
         current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -2014,8 +2016,8 @@ class Agent(object):
             target_token_count = self.max_tokens
             print(f"Pure cluster summarize: Using custom max_tokens target: {target_token_count}")
         else:
-            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
-            print(f"Pure cluster summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
+            target_token_count = int(context_window * self.trunc_frac)
+            print(f"Pure cluster summarize: Using fraction-based target: {target_token_count} ({self.trunc_frac} * {context_window})")
 
         # Calculate current total tokens from self._messages
         current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -2175,8 +2177,8 @@ class Agent(object):
             target_token_count = self.max_tokens
             print(f"Density summarize: Using custom max_tokens target: {target_token_count}")
         else:
-            target_token_count = int(context_window * MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC)
-            print(f"Density summarize: Using fraction-based target: {target_token_count} ({MESSAGE_SUMMARY_TRUNC_TOKEN_FRAC} * {context_window})")
+            target_token_count = int(context_window * self.trunc_frac)
+            print(f"Density summarize: Using fraction-based target: {target_token_count} ({self.trunc_frac} * {context_window})")
 
         # Calculate current total tokens from self._messages
         current_total_tokens = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
