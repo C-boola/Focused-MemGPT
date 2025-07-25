@@ -57,13 +57,29 @@ class SilentInterface(AgentInterface):
         elif msg and ("running" in msg.lower() or "success" in msg.lower()) and any(keyword in msg.lower() for keyword in ["memory", "archival", "core"]):
             print(f"[MEMORY] Function: {msg}")
 
+class CallbackInterface(SilentInterface):
+    """An interface that captures and stores function calls made by the agent."""
+    def __init__(self):
+        self.function_calls = []
+        super().__init__()
+
+    def function_message(self, msg, msg_obj=None) -> None:
+        # Call the parent class's method to still get the memory logs
+        super().function_message(msg, msg_obj)
+        
+        # Specifically capture the 'Running' messages for search functions
+        if msg and "running" in msg.lower() and ("archival_memory_search" in msg.lower() or "conversation_search" in msg.lower()):
+            self.function_calls.append(msg)
+    
+    def clear_calls(self):
+        self.function_calls = []
+
 # --- Constants ---
 memory_mode = "hybrid"
 
 MODULE_BASE_PATH = os.path.dirname(__file__)
 # --- Constants for Integrated Benchmark ---
 REFLECT_PERSONA_PATH = os.path.join(os.path.dirname(__file__), "data", "persona_reflect_and_archive.txt")
-ANSWER_PERSONA_PATH = os.path.join(os.path.dirname(__file__), "data", "persona_search_and_answer.txt")
 DATA_PATH = os.path.join(MODULE_BASE_PATH, "data", "longmemeval_s.json")
 ORACLE_PATH = os.path.join(MODULE_BASE_PATH, "data", "longmemeval_oracle.json")
 # OUTPUT_PATH will be set dynamically in main() based on mode and beta
@@ -117,9 +133,8 @@ def run_test_instance(
     agent_name = f"longmemeval_agent_{q_id}"
     log_debug(f"--- Starting Integrated Test Instance: {q_id} ---")
 
-    # 1. Create agent with the 'Search and Answer' persona
-    with open(ANSWER_PERSONA_PATH, 'r', encoding='utf-8') as f:
-        answer_persona_text = f.read()
+    # 1. Create agent with default persona; answering logic is now in the core system prompt
+    answer_persona_text = get_persona_text(DEFAULT_PERSONA)
 
     preset_config = available_presets[DEFAULT_PRESET]
     agent_state = AgentState(
@@ -135,9 +150,10 @@ def run_test_instance(
         },
     )
 
+    callback_interface = CallbackInterface()
     try:
-        agent = Agent(interface=SilentInterface(), agent_state=agent_state)
-        log_debug(f"Agent initialized with 'Search and Answer' persona.")
+        agent = Agent(interface=callback_interface, agent_state=agent_state)
+        log_debug(f"Agent initialized with default persona and system prompt-based search protocol.")
     except Exception as e:
         log_debug(f"FATAL ERROR: Could not instantiate Agent object. Error: {e}")
         return f"ERROR: AGENT_INSTANTIATION_FAILED"
@@ -246,10 +262,23 @@ Conversation Text:
     final_question = test_case['question']
     log_debug(f"Asking final question: '{final_question}'")
     
+    # CRITICAL: Clear any previous calls from the reflection phase before the final question
+    callback_interface.clear_calls()
+    
     hypothesis = "ERROR: NO_RESPONSE_FROM_AGENT_STEP"
     try:
         response_messages, _, _, _, _ = agent.step(user_message=json.dumps({'role': 'user', 'content': final_question}), return_dicts=True)
         
+        # After the step, check and log the function calls that were made
+        log_debug("\n===== FINAL STEP ANALYSIS =====")
+        if callback_interface.function_calls:
+            print("[ANALYSIS] Agent made the following memory search calls during the final step:")
+            for call in callback_interface.function_calls:
+                print(f"  -> {call}")
+        else:
+            print("[ANALYSIS] Agent did NOT make any memory search calls. Answer was likely from summarized context.")
+        log_debug("=============================\n")
+
         log_debug(f"Raw response from agent.step(): {response_messages}")
         if response_messages and isinstance(response_messages, list):
             assistant_message = next((msg['content'] for msg in reversed(response_messages) if msg.get('role') == 'assistant' and msg.get('content')), None)
