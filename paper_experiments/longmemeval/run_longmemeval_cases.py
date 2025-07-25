@@ -272,6 +272,7 @@ def run_test_instance_worker(base_config: MemGPTConfig, test_case: dict, memory_
             if assistant_message:
                 hypothesis = assistant_message['content']
             else:
+                print("\n\n\n\n\n" + str(response_messages) + "\n\n\n\n\n")
                 hypothesis = "ERROR: NO_ASSISTANT_MESSAGE_FOUND"
         
     except Exception as e:
@@ -351,9 +352,9 @@ def main():
     parser.add_argument("--prompt-type", choices=["memgpt_default", "xml", "xml_temporal_reasoning"], default="xml", help="Prompt type")
     parser.add_argument("--centroid-method", choices=["centroid", "medoid"], default="centroid", help="Centroid calculation method")
     parser.add_argument("--score-mode", choices=["inverted_focus"], help="Score mode modifier")
-    parser.add_argument("--batch-size", type=int, default=4, help="Number of test cases to run in parallel")
-    parser.add_argument("--max-workers", type=int, help="Maximum number of worker processes (default: batch-size)")
+    parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of worker processes")
     parser.add_argument("--trunc-frac", type=float, default=0.75, help="Token truncation fraction during summarization (default: 0.75)")
+    parser.add_argument("--resume-from", type=str, help="Path to a partially completed JSONL file to resume from")
 
     
     args = parser.parse_args()
@@ -371,9 +372,7 @@ def main():
         return
     
 
-    
-    if args.max_workers is None:
-        args.max_workers = args.batch_size
+
     
     # Set the global truncation fraction constant
     import memgpt.constants
@@ -388,27 +387,33 @@ def main():
     print(f"  Centroid method: {args.centroid_method.upper()}")
     print(f"  Score mode: {args.score_mode.upper() if args.score_mode else 'NONE'}")
     print(f"  Truncation fraction: {args.trunc_frac}")
-    print(f"  Batch size: {args.batch_size}")
     print(f"  Max workers: {args.max_workers}")
     print(f"  Test mode: {'ON' if args.test else 'OFF'}")
+    if args.resume_from:
+        print(f"  Resume from: {args.resume_from}")
     
     # Create output path
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"memgpt_hypotheses_cases_{args.prompt_type}_{args.mode}"
-    if args.mode == "hybrid":
-        output_filename += f"_beta{args.beta}"
-    if cluster_bool:
-        output_filename += "_cluster"
-    output_filename += f"_{args.centroid_method}"
-    if args.score_mode:
-        output_filename += f"_{args.score_mode}"
-    output_filename += f"_trunc{args.trunc_frac}"
-    if args.test:
-        output_filename += "_test"
-    output_filename += f"_batch{args.batch_size}_{timestamp}"
-    output_path = os.path.join(MODULE_BASE_PATH, f"{output_filename}.jsonl")
-    
-    print(f"Output file: {output_path}")
+    if args.resume_from:
+        # When resuming, append to the same file
+        output_path = args.resume_from
+        print(f"Output file: {output_path} (resuming/appending to existing file)")
+    else:
+        # Create new output file with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"memgpt_hypotheses_cases_{args.prompt_type}_{args.mode}"
+        if args.mode == "hybrid":
+            output_filename += f"_beta{args.beta}"
+        if cluster_bool:
+            output_filename += "_cluster"
+        output_filename += f"_{args.centroid_method}"
+        if args.score_mode:
+            output_filename += f"_{args.score_mode}"
+        output_filename += f"_trunc{args.trunc_frac}"
+        if args.test:
+            output_filename += "_test"
+        output_filename += f"_workers{args.max_workers}_{timestamp}"
+        output_path = os.path.join(MODULE_BASE_PATH, f"{output_filename}.jsonl")
+        print(f"Output file: {output_path}")
     
     # Load config and data
     config = MemGPTConfig.load()
@@ -418,15 +423,31 @@ def main():
     
     # Filter for test mode  
     if args.test:
-        test_cases = test_cases[70:]  # Use same range as original
+        test_cases = test_cases[287:]  # Use same range as original
         print(f"Test mode: Limited to {len(test_cases)} cases")
     
     # --- RESUME LOGIC ---
     completed_question_ids = set()
-    if os.path.exists(output_path) and not args.test:
-        print(f"Previous run detected. Checking existing results...")
+    resume_file_path = None
+    
+    # Determine which file to check for completed IDs
+    if args.resume_from:
+        resume_file_path = args.resume_from
+        if not os.path.exists(resume_file_path):
+            print(f"Error: Resume file '{resume_file_path}' does not exist!")
+            return
+    elif os.path.exists(output_path) and not args.test:
+        resume_file_path = output_path
+    
+    # Read completed IDs from the resume file
+    if resume_file_path:
+        if args.resume_from:
+            print(f"Resuming from specified file: {resume_file_path}")
+        else:
+            print(f"Previous run detected. Checking existing results...")
+        
         try:
-            with open(output_path, 'r', encoding='utf-8') as f:
+            with open(resume_file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     try:
                         data = json.loads(line)
@@ -435,13 +456,18 @@ def main():
                     except json.JSONDecodeError:
                         continue
         except Exception as e:
-            print(f"Error reading existing results: {e}. Starting fresh.")
+            print(f"Error reading existing results from {resume_file_path}: {e}. Starting fresh.")
             completed_question_ids = set()
 
     remaining_test_cases = [case for case in test_cases if case['question_id'] not in completed_question_ids]
     
-    if completed_question_ids and not args.test:
-        print(f"Found {len(completed_question_ids)} completed instances. Resuming with {len(remaining_test_cases)} remaining cases.")
+    if completed_question_ids:
+        if args.resume_from:
+            print(f"Found {len(completed_question_ids)} completed instances in resume file. Resuming with {len(remaining_test_cases)} remaining cases.")
+        elif not args.test:
+            print(f"Found {len(completed_question_ids)} completed instances. Resuming with {len(remaining_test_cases)} remaining cases.")
+        else:
+            print(f"Starting {'test' if args.test else 'benchmark'} run on {len(remaining_test_cases)} cases.")
     else:
         print(f"Starting {'test' if args.test else 'benchmark'} run on {len(remaining_test_cases)} cases.")
     
@@ -450,7 +476,7 @@ def main():
         return
     
     # --- PARALLEL PROCESSING ---
-    print(f"\nStarting parallel processing with {args.max_workers} workers, batch size {args.batch_size}...")
+    print(f"\nStarting parallel processing with {args.max_workers} workers...")
     
     # Prepare arguments for workers
     worker_args = []
@@ -462,50 +488,45 @@ def main():
         )
         worker_args.append(args_tuple)
     
-    # Process in batches
+    # Process with rolling parallel execution
     total_processed = 0
     total_errors = 0
     
-    # Create output file if it doesn't exist
-    if args.test or not os.path.exists(output_path):
+    # Create output file if it doesn't exist (but don't overwrite when resuming)
+    if (args.test and not args.resume_from) or (not os.path.exists(output_path) and not args.resume_from):
         with open(output_path, 'w', encoding='utf-8') as f:
             pass  # Create empty file
     
     try:
         with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
-            # Process in batches
-            for batch_start in tqdm(range(0, len(worker_args), args.batch_size), desc="Processing batches"):
-                batch_end = min(batch_start + args.batch_size, len(worker_args))
-                batch_args = worker_args[batch_start:batch_end]
-                
-                # Submit batch jobs
-                future_to_args = {executor.submit(run_single_test_case, args): args for args in batch_args}
-                
-                # Collect results for this batch
-                batch_results = []
+            # Submit all jobs at once - executor will manage the parallel execution
+            future_to_args = {executor.submit(run_single_test_case, args): args for args in worker_args}
+            
+            # Process results as they complete with progress bar
+            with tqdm(total=len(worker_args), desc="Processing cases") as pbar:
                 for future in as_completed(future_to_args):
                     try:
                         result = future.result()
-                        batch_results.append(result)
                         
                         if result["success"]:
                             total_processed += 1
+                            # Write individual result immediately
+                            write_results_safely([result], output_path)
                         else:
                             total_errors += 1
-                            print(f"Error in case {result['question_id']}: {result.get('error', 'Unknown error')}")
+                            print(f"\nError in case {result['question_id']}: {result.get('error', 'Unknown error')}")
                             
                     except Exception as e:
                         total_errors += 1
-                        print(f"Future execution error: {e}")
-                
-                # Write results for this batch
-                write_results_safely(batch_results, output_path)
-                
-                # Progress update
-                batch_num = batch_start // args.batch_size + 1
-                total_batches = (len(worker_args) + args.batch_size - 1) // args.batch_size
-                print(f"Completed batch {batch_num}/{total_batches}. "
-                      f"Total processed: {total_processed}, Errors: {total_errors}")
+                        print(f"\nFuture execution error: {e}")
+                    
+                    # Update progress bar
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'Processed': total_processed, 
+                        'Errors': total_errors,
+                        'Success Rate': f"{total_processed/(total_processed+total_errors)*100:.1f}%" if (total_processed+total_errors) > 0 else "0%"
+                    })
                       
     except KeyboardInterrupt:
         print("\n\nBenchmark interrupted by user (Ctrl+C). Progress has been saved.")

@@ -1,6 +1,6 @@
 import os
 import base64
-from sqlalchemy import create_engine, Column, String, BIGINT, select, inspect, text, JSON, BLOB, BINARY, ARRAY, DateTime
+from sqlalchemy import QueuePool, create_engine, Column, String, BIGINT, select, inspect, text, JSON, BLOB, BINARY, ARRAY, DateTime
 from sqlalchemy import func, or_, and_
 from sqlalchemy import desc, asc
 from sqlalchemy.orm import sessionmaker, mapped_column, declarative_base
@@ -449,8 +449,34 @@ class PostgresStorageConnector(SQLStorageConnector):
             url = os.getenv("MEMGPT_PG_URL", "localhost")
             self.uri = f"postgresql+pg8000://{user}:{password}@{url}:{port}/{db}"
 
+        # Performance-optimized engine configuration
+        engine_kwargs = {
+            # Connection pooling settings
+            'poolclass': QueuePool,
+            'pool_size': int(os.getenv("MEMGPT_PG_POOL_SIZE", "20")),  # Base number of connections
+            'max_overflow': int(os.getenv("MEMGPT_PG_MAX_OVERFLOW", "30")),  # Additional connections beyond pool_size
+            'pool_timeout': int(os.getenv("MEMGPT_PG_POOL_TIMEOUT", "30")),  # Timeout for getting connection
+            'pool_recycle': int(os.getenv("MEMGPT_PG_POOL_RECYCLE", "3600")),  # Recycle connections after 1 hour
+            'pool_pre_ping': True,  # Verify connections before use
+            'pool_reset_on_return': 'commit',  # Reset connection state on return
+            
+            # Performance settings
+            'echo': False,  # Disable SQL logging for performance
+            'echo_pool': False,  # Disable pool logging
+            'future': True,  # Use SQLAlchemy 2.0 style
+            
+            # Connection settings
+            # 'connect_args': {
+            #     'command_timeout': 60,
+            #     'server_settings': {
+            #         'jit': 'off',  # Disable JIT for better performance on short queries
+            #         'application_name': 'memgpt_connector',
+            #     }
+            # }
+        }
+
         # create engine
-        self.engine = create_engine(self.uri)
+        self.engine = create_engine(self.uri, **engine_kwargs)
 
         for c in self.db_model.__table__.columns:
             if c.name == "embedding":

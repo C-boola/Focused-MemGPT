@@ -64,7 +64,11 @@ def core_memory_append(self: Agent, name: str, content: str) -> Optional[str]:
         Optional[str]: None is always returned as this function does not produce a response.
     """
     self.memory.edit_append(name, content)
-    self.rebuild_memory()
+    # Use cache-optimized rebuild if enabled, otherwise use standard rebuild
+    if getattr(self, 'cache_optimized', True):
+        self.rebuild_memory_cache_optimized()
+    else:
+        self.rebuild_memory()
     return None
 
 
@@ -81,7 +85,11 @@ def core_memory_replace(self: Agent, name: str, old_content: str, new_content: s
         Optional[str]: None is always returned as this function does not produce a response.
     """
     self.memory.edit_replace(name, old_content, new_content)
-    self.rebuild_memory()
+    # Use cache-optimized rebuild if enabled, otherwise use standard rebuild
+    if getattr(self, 'cache_optimized', True):
+        self.rebuild_memory_cache_optimized()
+    else:
+        self.rebuild_memory()
     return None
 
 

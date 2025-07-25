@@ -1,0 +1,12 @@
+beta,overall_accuracy,knowledge-update_accuracy,knowledge-update_count,single-session-assistant_accuracy,single-session-assistant_count,single-session-user_accuracy,single-session-user_count,multi-session_accuracy,multi-session_count,single-session-preference_accuracy,single-session-preference_count,temporal-reasoning_accuracy,temporal-reasoning_count
+0.0,0.4533,,0,0.7679,56,0.7143,70,0.2632,133,0.1,30,,0
+0.1,0.4948,,0,0.7857,56,0.7143,70,0.3459,133,0.1,30,,0
+0.2,0.4706,,0,0.7857,56,0.6714,70,0.3083,133,0.1333,30,,0
+0.3,0.4844,,0,0.8036,56,0.7,70,0.3158,133,0.1333,30,,0
+0.4,0.5052,,0,0.8036,56,0.7429,70,0.3459,133,0.1,30,,0
+0.5,0.4671,,0,0.75,56,0.7,70,0.3008,133,0.1333,30,,0
+0.6,0.474,,0,0.7857,56,0.7,70,0.3158,133,0.0667,30,,0
+0.7,0.5087,,0,0.8393,56,0.7286,70,0.3459,133,0.1,30,,0
+0.8,0.5156,,0,0.8214,56,0.7429,70,0.3534,133,0.1333,30,,0
+0.9,0.5087,,0,0.8214,56,0.7571,70,0.3383,133,0.1,30,,0
+1.0,0.4674,,0,0.6607,56,0.7083,72,0.3383,133,0.1,30,,0

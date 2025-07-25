@@ -151,7 +151,7 @@ def query_embedding(embedding_model, query_text: str):
     return query_vec
 
 
-def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None):
+def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None, async_mode = False):
     """Return LlamaIndex embedding model to use for embeddings"""
 
     endpoint_type = config.embedding_endpoint_type
@@ -161,10 +161,18 @@ def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None
 
     if endpoint_type == "openai":
         assert credentials.openai_key is not None
-        from llama_index.embeddings.openai import OpenAIEmbedding
 
         additional_kwargs = {"user_id": user_id} if user_id else {}
-        model = OpenAIEmbedding(
+        if async_mode:
+            from langchain_openai import OpenAIEmbeddings
+            model = OpenAIEmbeddings(
+                model=config.embedding_model,
+                api_key=credentials.openai_key,
+                # additional_kwargs=additional_kwargs,
+            )
+        else:
+            from llama_index.embeddings.openai import OpenAIEmbedding
+            model = OpenAIEmbedding(
             model=config.embedding_model,
             api_base=config.embedding_endpoint,
             api_key=credentials.openai_key,
@@ -234,6 +242,52 @@ def create_embedding(text: str, embedding_config: EmbeddingConfig, model: Option
     # If it's a list of texts (e.g. from chunking), it might be get_text_embedding_batch.
     # We'll assume get_text_embedding for a single string for now.
     embedding_vector = embed_model.get_text_embedding(texts_to_embed[0])
+    
+    # Ensure the embedding is a list of floats and pad if necessary (though padding is often context-specific)
+    if not isinstance(embedding_vector, list) or not all(isinstance(x, float) for x in embedding_vector):
+        # Try to convert if it's a numpy array, common for some embedding libraries
+        if hasattr(embedding_vector, 'tolist'):
+            embedding_vector = embedding_vector.tolist()
+        else:
+            raise TypeError(f"Embedding generation did not return a list of floats. Got: {type(embedding_vector)}")
+
+    # Padding to MAX_EMBEDDING_DIM is usually for storage in a DB with fixed vector sizes.
+    # If create_embedding is for general use, this might be optional or handled by the caller.
+    # query_embedding function already handles padding.
+    # For now, returning raw embedding from the model.
+    return embedding_vector
+
+async def acreate_embedding(text: str, embedding_config: EmbeddingConfig, model: Optional[str] = None) -> List[float]:
+    """
+    Generates an embedding for the given text using the specified configuration.
+    This function acts as a wrapper around the LlamaIndex embedding model logic.
+    """
+    # Initialize the embedding model using the agent's config
+    # The 'model' parameter here is for potentially overriding the model from embedding_config if needed,
+    # but embedding_model function primarily uses embedding_config.
+    
+    # Extract user_id from embedding_config if available and relevant for the model
+    # user_id_to_pass = None # Placeholder, adjust if user_id needs to be sourced differently or passed through
+    # For instance, if embedding_config could carry a user_id or if it's globally available
+    
+    embed_model = embedding_model(config=embedding_config, async_mode=True) # user_id can be passed if available in config/context
+
+    # Check if the text needs to be split due to length constraints
+    # The specific model name might be in embedding_config.embedding_model
+    texts_to_embed = check_and_split_text(text, embedding_config.embedding_model if embedding_config else DEFAULT_EMBEDDING_MODEL)
+    
+    # For simplicity, if splitting occurs, we might average embeddings or handle appropriately.
+    # Here, assuming check_and_split_text returns a list and we use the first part,
+    # or that it handles overly long text by truncation/error.
+    # A more robust implementation might embed chunks and average them.
+    if not texts_to_embed:
+        raise ValueError("Text resulted in no content after splitting/checking.")
+
+    # LlamaIndex's BaseEmbedding models usually have a get_text_embedding or similar method.
+    # If it's a list of texts (e.g. from chunking), it might be get_text_embedding_batch.
+    # We'll assume get_text_embedding for a single string for now.
+    embedding_vector = await embed_model.aembed_query(texts_to_embed[0])
+    # print("Embedded vector!")
     
     # Ensure the embedding is a list of floats and pad if necessary (though padding is often context-specific)
     if not isinstance(embedding_vector, list) or not all(isinstance(x, float) for x in embedding_vector):

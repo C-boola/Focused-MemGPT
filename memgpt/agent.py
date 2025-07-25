@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import uuid
 import inspect
@@ -48,7 +49,7 @@ from memgpt.constants import (
 )
 from .errors import LLMError
 from .functions.functions import USER_FUNCTIONS_DIR, load_all_function_sets
-from memgpt.embeddings import create_embedding, calculate_centroid, calculate_medoid, calculate_cosine_distances
+from memgpt.embeddings import acreate_embedding, create_embedding, calculate_centroid, calculate_medoid, calculate_cosine_distances
 
 
 def link_functions(function_schemas: list):
@@ -137,6 +138,49 @@ def construct_system_with_memory(
     return full_system_message
 
 
+def construct_system_with_memory_cache_optimized(
+    system: str,
+    memory: InContextMemory,
+    memory_edit_timestamp: str,
+    archival_memory: Optional[ArchivalMemory] = None,
+    recall_memory: Optional[RecallMemory] = None,
+    include_char_count: bool = True,
+):
+    """
+    Cache-optimized version that separates stable and dynamic content.
+    Returns a tuple of (stable_system_message, dynamic_memory_message).
+    
+    The stable part contains the base system prompt and core memory content.
+    The dynamic part contains timestamps and memory counts that change frequently.
+    """
+    # Stable content - base system prompt and core memory content
+    stable_system_message = "\n".join(
+        [
+            system,
+            "\n",
+            "### Memory",
+            "\nCore memory shown below (limited in size, additional information stored in archival / recall memory):",
+            f'<persona characters="{len(memory.persona)}/{memory.persona_char_limit}">' if include_char_count else "<persona>",
+            memory.persona,
+            "</persona>",
+            f'<human characters="{len(memory.human)}/{memory.human_char_limit}">' if include_char_count else "<human>",
+            memory.human,
+            "</human>",
+        ]
+    )
+    
+    # Dynamic content - frequently changing information
+    dynamic_memory_message = "\n".join(
+        [
+            f"### Memory Status [last modified: {memory_edit_timestamp.strip()}]",
+            f"{len(recall_memory) if recall_memory else 0} previous messages between you and the user are stored in recall memory (use functions to access them)",
+            f"{len(archival_memory) if archival_memory else 0} total memories you created are stored in archival memory (use functions to access them)",
+        ]
+    )
+    
+    return stable_system_message, dynamic_memory_message
+
+
 def initialize_message_sequence(
     model: str,
     system: str,
@@ -145,35 +189,70 @@ def initialize_message_sequence(
     recall_memory: Optional[RecallMemory] = None,
     memory_edit_timestamp: Optional[str] = None,
     include_initial_boot_message: bool = True,
+    cache_optimized: bool = True,  # New parameter to enable cache optimization
 ) -> List[dict]:
     if memory_edit_timestamp is None:
         memory_edit_timestamp = get_local_time()
 
-    full_system_message = construct_system_with_memory(
-        system, memory, memory_edit_timestamp, archival_memory=archival_memory, recall_memory=recall_memory
-    )
-    first_user_message = get_login_event()  # event letting MemGPT know the user just logged in
+    if cache_optimized:
+        # Use cache-optimized structure
+        stable_system_message, dynamic_memory_message = construct_system_with_memory_cache_optimized(
+            system, memory, memory_edit_timestamp, archival_memory=archival_memory, recall_memory=recall_memory
+        )
+        
+        first_user_message = get_login_event()  # event letting MemGPT know the user just logged in
 
-    if include_initial_boot_message:
-        if model is not None and "gpt-3.5" in model:
-            initial_boot_messages = get_initial_boot_messages("startup_with_send_message_gpt35")
+        if include_initial_boot_message:
+            if model is not None and "gpt-3.5" in model:
+                initial_boot_messages = get_initial_boot_messages("startup_with_send_message_gpt35")
+            else:
+                initial_boot_messages = get_initial_boot_messages("startup_with_send_message")
+            
+            # Cache-optimized order: stable system, initial boot messages, dynamic memory as user message, login
+            messages = (
+                [
+                    {"role": "system", "content": stable_system_message},
+                ]
+                + initial_boot_messages
+                + [
+                    {"role": "user", "content": dynamic_memory_message},  # Dynamic content as user message
+                    {"role": "user", "content": first_user_message},
+                ]
+            )
+
         else:
-            initial_boot_messages = get_initial_boot_messages("startup_with_send_message")
-        messages = (
-            [
-                {"role": "system", "content": full_system_message},
-            ]
-            + initial_boot_messages
-            + [
+            messages = [
+                {"role": "system", "content": stable_system_message},
+                {"role": "user", "content": dynamic_memory_message},  # Dynamic content as user message  
                 {"role": "user", "content": first_user_message},
             ]
-        )
-
     else:
-        messages = [
-            {"role": "system", "content": full_system_message},
-            {"role": "user", "content": first_user_message},
-        ]
+        # Use original structure for backward compatibility
+        full_system_message = construct_system_with_memory(
+            system, memory, memory_edit_timestamp, archival_memory=archival_memory, recall_memory=recall_memory
+        )
+        first_user_message = get_login_event()  # event letting MemGPT know the user just logged in
+
+        if include_initial_boot_message:
+            if model is not None and "gpt-3.5" in model:
+                initial_boot_messages = get_initial_boot_messages("startup_with_send_message_gpt35")
+            else:
+                initial_boot_messages = get_initial_boot_messages("startup_with_send_message")
+            messages = (
+                [
+                    {"role": "system", "content": full_system_message},
+                ]
+                + initial_boot_messages
+                + [
+                    {"role": "user", "content": first_user_message},
+                ]
+            )
+
+        else:
+            messages = [
+                {"role": "system", "content": full_system_message},
+                {"role": "user", "content": first_user_message},
+            ]
 
     return messages
 
@@ -196,6 +275,7 @@ class Agent(object):
         centroid_method: Optional[str] = "centroid",  # new parameter to switch between centroid and medoid
         score_mode: Optional[str] = None,  # new parameter to modify scoring (e.g. "inverted_focus")
         max_tokens: Optional[int] = None,  # new parameter to control compression target tokens
+        cache_optimized: Optional[bool] = True,  # new parameter to enable prompt caching optimization
         # extras
         messages_total: Optional[int] = None,  # TODO remove?
         first_message_verify_mono: bool = True,  # TODO move to config?
@@ -249,6 +329,7 @@ class Agent(object):
                     "centroid_method": centroid_method if centroid_method is not None else "centroid", # Store centroid_method from preset creation
                     "score_mode": score_mode, # Store score_mode from preset creation
                     "max_tokens": max_tokens, # Store max_tokens from preset creation
+                    "cache_optimized": cache_optimized,  # Store cache_optimized from preset creation
                 },
             )
             self.mem_mode = mem_mode if mem_mode is not None else "focus"
@@ -257,6 +338,7 @@ class Agent(object):
             self.centroid_method = centroid_method if centroid_method is not None else "centroid"
             self.score_mode = score_mode  # Store score_mode
             self.max_tokens = max_tokens  # Store max_tokens
+            self.cache_optimized = cache_optimized if cache_optimized is not None else True  # Store cache_optimized
             self.prompt_type = "memgpt_default"  # Default prompt type for preset-based agents
 
         # An agent can also be created directly from AgentState
@@ -272,6 +354,7 @@ class Agent(object):
             self.centroid_method = agent_state.state.get("centroid_method", "centroid") # Load centroid_method from state
             self.score_mode = agent_state.state.get("score_mode", None) # Load score_mode from state
             self.max_tokens = agent_state.state.get("max_tokens", None) # Load max_tokens from state
+            self.cache_optimized = agent_state.state.get("cache_optimized", True) # Load cache_optimized from state (default True for new agents)
             self.prompt_type = agent_state.state.get("prompt_type", "memgpt_default") # Load prompt_type from state
 
         else:
@@ -357,6 +440,7 @@ class Agent(object):
                 self.model,
                 self.system,
                 self.memory,
+                cache_optimized=self.cache_optimized,  # Use the agent's cache optimization setting
             )
             init_messages_objs = []
             for msg in init_messages:
@@ -411,6 +495,33 @@ class Agent(object):
         new_messages = [self._messages[0]] + added_messages + self._messages[1:]  # prepend (no system)
         self._messages = new_messages
         self.messages_total += len(added_messages)  # still should increment the message counter (summaries are additions too)
+
+    def _prepend_to_messages_cache_optimized(self, added_messages: List[Message]):
+        """Cache-optimized version that inserts messages without invalidating stable system cache.
+        
+        In cache-optimized structure:
+        [0] = stable system message (cacheable)
+        [1] = dynamic memory message (changes frequently) 
+        [2] = initial boot messages or login (stable)
+        [3+] = conversation messages and summaries
+        
+        This function inserts summaries after the stable content but before recent conversation.
+        """
+        assert all([isinstance(msg, Message) for msg in added_messages])
+
+        self.persistence_manager.prepend_to_messages(added_messages)
+
+        # Check if we're using cache-optimized structure
+        if len(self._messages) >= 3 and "Memory Status" in self._messages[1].text:
+            # Cache-optimized structure: insert after dynamic memory message [1]
+            # This preserves the stable system message [0] for caching
+            new_messages = self._messages[:2] + added_messages + self._messages[2:]
+        else:
+            # Fall back to original behavior for non-cache-optimized structure
+            new_messages = [self._messages[0]] + added_messages + self._messages[1:]
+            
+        self._messages = new_messages
+        self.messages_total += len(added_messages)
 
     def _append_to_messages(self, added_messages: List[Message]):
         """Wrapper around self.messages.append to allow additional calls to a state/persistence manager"""
@@ -1176,16 +1287,29 @@ class Agent(object):
         prior_len = len(self.messages)
         self._trim_messages(cutoff)
         packed_summary_message = {"role": "user", "content": summary_message}
-        self._prepend_to_messages(
-            [
-                Message.dict_to_message(
-                    agent_id=self.agent_state.id,
-                    user_id=self.agent_state.user_id,
-                    model=self.model,
-                    openai_message_dict=packed_summary_message,
-                )
-            ]
-        )
+        # Use cache-optimized prepend if enabled, otherwise use standard prepend
+        if self.cache_optimized:
+            self._prepend_to_messages_cache_optimized(
+                [
+                    Message.dict_to_message(
+                        agent_id=self.agent_state.id,
+                        user_id=self.agent_state.user_id,
+                        model=self.model,
+                        openai_message_dict=packed_summary_message,
+                    )
+                ]
+            )
+        else:
+            self._prepend_to_messages(
+                [
+                    Message.dict_to_message(
+                        agent_id=self.agent_state.id,
+                        user_id=self.agent_state.user_id,
+                        model=self.model,
+                        openai_message_dict=packed_summary_message,
+                    )
+                ]
+            )
 
         # reset alert
         self.agent_alerted_about_memory_pressure = False
@@ -1378,7 +1502,10 @@ class Agent(object):
         self._messages = new_messages_list
         
         # Prepend the summary message (this also handles persistence of the new summary message)
-        self._prepend_to_messages([summary_message_to_prepend])
+        if self.cache_optimized:
+            self._prepend_to_messages_cache_optimized([summary_message_to_prepend])
+        else:
+            self._prepend_to_messages([summary_message_to_prepend])
         
         self.agent_alerted_about_memory_pressure = False
         
@@ -1702,7 +1829,10 @@ class Agent(object):
             print(f"Hybrid summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
 
         self._messages = new_messages_list
-        self._prepend_to_messages([summary_message_to_prepend])
+        if self.cache_optimized:
+            self._prepend_to_messages_cache_optimized([summary_message_to_prepend])
+        else:
+            self._prepend_to_messages([summary_message_to_prepend])
         self.agent_alerted_about_memory_pressure = False
 
         final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -2014,7 +2144,10 @@ class Agent(object):
             print(f"Pure cluster summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
 
         self._messages = new_messages_list
-        self._prepend_to_messages([summary_message_to_prepend])
+        if self.cache_optimized:
+            self._prepend_to_messages_cache_optimized([summary_message_to_prepend])
+        else:
+            self._prepend_to_messages([summary_message_to_prepend])
         self.agent_alerted_about_memory_pressure = False
 
         final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -2353,7 +2486,10 @@ class Agent(object):
             print(f"Density summarize: Deleted {deleted_count_pm}/{len(message_ids_to_remove_set)} messages from persistence manager.")
 
         self._messages = new_messages_list
-        self._prepend_to_messages([summary_message_to_prepend])
+        if self.cache_optimized:
+            self._prepend_to_messages_cache_optimized([summary_message_to_prepend])
+        else:
+            self._prepend_to_messages([summary_message_to_prepend])
         self.agent_alerted_about_memory_pressure = False
 
         final_token_count = sum(count_tokens(str(msg.to_openai_dict())) for msg in self._messages)
@@ -2390,6 +2526,57 @@ class Agent(object):
                 agent_id=self.agent_state.id, user_id=self.agent_state.user_id, model=self.model, openai_message_dict=new_system_message
             )
         )
+
+    def rebuild_memory_cache_optimized(self):
+        """Cache-optimized version that rebuilds memory while preserving stable system content"""
+        # Check if we're using cache-optimized structure by looking for dynamic memory message
+        if len(self._messages) >= 3 and "Memory Status" in self._messages[1].text:
+            # Cache-optimized structure: [system, dynamic_memory, login/boot, ...]
+            curr_stable_system_message = self._messages[0]
+            curr_dynamic_memory_message = self._messages[1]
+            
+            # Generate new messages
+            stable_system_message, dynamic_memory_message = construct_system_with_memory_cache_optimized(
+                self.system,
+                self.memory,
+                get_local_time(),
+                archival_memory=self.persistence_manager.archival_memory,
+                recall_memory=self.persistence_manager.recall_memory,
+            )
+            
+            # Check if stable content changed (rarely should)
+            stable_diff = united_diff(curr_stable_system_message.text, stable_system_message)
+            if stable_diff.strip():
+                printd(f"Rebuilding stable system content (cache will be invalidated)...\nDiff:\n{stable_diff}")
+                # Update the system message
+                new_stable_system_msg = Message.dict_to_message(
+                    agent_id=self.agent_state.id, 
+                    user_id=self.agent_state.user_id, 
+                    model=self.model, 
+                    openai_message_dict={"role": "system", "content": stable_system_message}
+                )
+                self._swap_system_message(new_stable_system_msg)
+            
+            # Check if dynamic content changed (frequently will)
+            dynamic_diff = united_diff(curr_dynamic_memory_message.text, dynamic_memory_message)
+            if dynamic_diff.strip():
+                printd(f"Updating dynamic memory content (cache preserved for stable content)...\nDiff:\n{dynamic_diff}")
+                # Update the dynamic memory message
+                new_dynamic_memory_msg = Message.dict_to_message(
+                    agent_id=self.agent_state.id,
+                    user_id=self.agent_state.user_id, 
+                    model=self.model,
+                    openai_message_dict={"role": "user", "content": dynamic_memory_message}
+                )
+                
+                # Replace the dynamic memory message (index 1)
+                self.persistence_manager.recall_memory.storage.delete(filters={"id": self._messages[1].id})
+                self._messages[1] = new_dynamic_memory_msg
+                self.persistence_manager.recall_memory.storage.insert(new_dynamic_memory_msg)
+                
+        else:
+            # Fall back to original rebuild_memory if not using cache-optimized structure
+            self.rebuild_memory()
 
     def add_function(self, function_name: str) -> str:
         if function_name in self.functions_python.keys():
@@ -2447,6 +2634,7 @@ class Agent(object):
             "score_mode": self.score_mode,  # Persist score_mode
             "max_tokens": self.max_tokens,  # Persist max_tokens
             "prompt_type": self.prompt_type,  # Persist prompt_type
+            "cache_optimized": self.cache_optimized,  # Persist cache_optimized
         }
 
         self.agent_state = AgentState(
@@ -2524,6 +2712,9 @@ class Agent(object):
             return pair_embeddings
 
         print(f"Creating robust embeddings for {len(message_sequence)} messages...")
+
+        embedding_coroutines = []
+        message_ids = []
         
         for i in range(len(message_sequence) - 1):
             msg1 = message_sequence[i]
@@ -2572,11 +2763,12 @@ class Agent(object):
 
                     try:
                         # Create embedding for the combined text
-                        embedding_vector = create_embedding(
+                        coroutine = acreate_embedding(
                             text=combined_text,
                             embedding_config=embedding_config,
                         )
-                        pair_embeddings.append((msg1.id, msg2.id, embedding_vector))
+                        message_ids.append((msg1.id, msg2.id))
+                        embedding_coroutines.append(coroutine)
                             
                     except Exception as e:
                         print(f"Error creating embedding for pair (user_msg_id={msg1.id}, assistant_msg_id={msg2.id}): {e}")
@@ -2585,6 +2777,26 @@ class Agent(object):
                 except Exception as e:
                     print(f"Error processing message pair at index {i}: {e}")
                     continue
+        async def create_embeddings(coros):
+            return await asyncio.gather(*coros)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # no loop in this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if not loop.is_running():
+            embedding_vectors = loop.run_until_complete(create_embeddings(embedding_coroutines))
+        else:
+            # if you do find a running loop (e.g. in Jupyter), you can
+            # temporarily allow nesting via nest_asyncio, or schedule tasks
+            import nest_asyncio
+            nest_asyncio.apply()
+            embedding_vectors = loop.run_until_complete(create_embeddings(embedding_coroutines))
+
+        for i, (msg1_id, msg2_id) in enumerate(message_ids):
+            pair_embeddings.append((msg1_id, msg2_id, embedding_vectors[i]))
 
         print(f"Successfully created {len(pair_embeddings)} message pair embeddings")
         return pair_embeddings
