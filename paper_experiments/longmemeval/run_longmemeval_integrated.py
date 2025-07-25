@@ -207,10 +207,22 @@ Conversation Text:
                 if args.get("core_facts"):
                     for fact in args["core_facts"]:
                         try:
-                            log_debug(f"Saving to Core Memory: {fact}")
+                            log_debug(f"Attempting to save to Core Memory: {fact}")
                             agent.memory.edit_append('human', fact)
+                            log_debug(f"Successfully saved to Core Memory.")
+                        except ValueError as e:
+                            # This is the CORE-TO-ARCHIVAL FALLBACK logic
+                            if "exceeds character limit" in str(e).lower():
+                                log_debug(f"Core Memory full. Rerouting to Archival Memory: {fact}")
+                                try:
+                                    agent.persistence_manager.archival_memory.insert(fact)
+                                    log_debug(f"Successfully saved to Archival Memory as fallback.")
+                                except Exception as arch_e:
+                                    log_debug(f"Warning: Archival memory fallback failed: {arch_e}")
+                            else:
+                                log_debug(f"Warning: Core memory append failed with a non-size error: {e}")
                         except Exception as e:
-                            log_debug(f"Warning: Core memory append failed: {e}")
+                            log_debug(f"Warning: An unexpected error occurred during core memory append: {e}")
                 
                 if args.get("archivable_facts"):
                     for fact in args["archivable_facts"]:
